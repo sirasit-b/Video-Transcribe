@@ -1,0 +1,10 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+python-multipart==0.0.12
+openai==1.55.3
+PyMuPDF==1.24.14
+PyJWT==2.10.1
+bcrypt==4.2.1

@@ -2,7 +2,6 @@ services:
   db:
     image: postgres:15-alpine
     container_name: borntodev-postgres
-    platform: linux/amd64
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
@@ -23,7 +22,6 @@ services:
       context: ./frame-extractor-rs
       dockerfile: Dockerfile
     container_name: borntodev-frame-extractor
-    platform: linux/amd64
     environment:
       - VIDEO_ROOT=/app/videos
       - OUTPUT_ROOT=/app/frames
@@ -37,7 +35,6 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: borntodev-backend
-    platform: linux/amd64
     ports:
       - "8734:8000"
     environment:
@@ -72,7 +69,6 @@ services:
         # Baked into the client bundle at build time — rebuild the image to change it.
         NEXT_PUBLIC_API_URL: http://localhost:8734
     container_name: borntodev-frontend
-    platform: linux/amd64
     ports:
       - "4287:3000"
     depends_on:

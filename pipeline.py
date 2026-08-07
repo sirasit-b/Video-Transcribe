@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.error
@@ -9,9 +10,15 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import imageio_ffmpeg
 from openai import OpenAI
 from dotenv import load_dotenv
+
+
+def _ffmpeg_exe() -> str:
+	# Use the system ffmpeg (installed via apt in the Dockerfile) instead of
+	# imageio_ffmpeg's bundled binary, which only ships an x86_64 build for Linux —
+	# forcing QEMU emulation (and a large slowdown) on arm64 hosts.
+	return shutil.which("ffmpeg") or "ffmpeg"
 
 
 def extract_audio_to_mp3(input_video: str, output_mp3: str | None = None) -> str:
@@ -22,7 +29,7 @@ def extract_audio_to_mp3(input_video: str, output_mp3: str | None = None) -> str
 	out_path = Path(output_mp3) if output_mp3 else input_path.with_suffix(".mp3")
 
 	# Whisper only uses 16kHz mono, so downmix + downsample to shrink the upload payload.
-	ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+	ffmpeg_exe = _ffmpeg_exe()
 	cmd = [
 		ffmpeg_exe,
 		"-i", str(input_path),
@@ -45,7 +52,7 @@ def get_video_duration_seconds(video_path: str) -> float:
 	if not input_path.exists():
 		raise FileNotFoundError(f"Input file not found: {input_path}")
 
-	ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+	ffmpeg_exe = _ffmpeg_exe()
 	result = subprocess.run(
 		[
 			ffmpeg_exe,
@@ -89,7 +96,7 @@ def extract_evenly_spaced_frames(video_path: str, frame_count: int, output_dir: 
 		)
 
 	duration = get_video_duration_seconds(str(video_file))
-	ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+	ffmpeg_exe = _ffmpeg_exe()
 
 	def _extract_one(index: int) -> tuple[int, Path]:
 		timestamp = duration * (index + 0.5) / frame_count
@@ -184,7 +191,7 @@ def _transcribe_chunk(client: OpenAI, audio_path: str) -> tuple[str, list[dict]]
 
 
 def _split_audio_into_chunks(audio_path: str, chunk_seconds: int, out_dir: str) -> list[Path]:
-	ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+	ffmpeg_exe = _ffmpeg_exe()
 	pattern = str(Path(out_dir) / "chunk_%04d.mp3")
 	cmd = [
 		ffmpeg_exe,
