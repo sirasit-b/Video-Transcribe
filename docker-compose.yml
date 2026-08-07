@@ -1,0 +1,87 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: borntodev-postgres
+    platform: linux/amd64
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-borntodev_db}
+    ports:
+      - "6879:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  frame-extractor:
+    build:
+      context: ./frame-extractor-rs
+      dockerfile: Dockerfile
+    container_name: borntodev-frame-extractor
+    platform: linux/amd64
+    environment:
+      - VIDEO_ROOT=/app/videos
+      - OUTPUT_ROOT=/app/frames
+    volumes:
+      - videos_data:/app/videos
+      - frames_data:/app/frames
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: borntodev-backend
+    platform: linux/amd64
+    ports:
+      - "8734:8000"
+    environment:
+      # Everything else (JWT_SECRET_KEY, APP_ENV, FRONTEND_ORIGINS, OPENAI_API_KEY,
+      # WEB_CONCURRENCY, ...) comes from env_file below.
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-borntodev_db}
+      - FRAME_EXTRACTOR_URL=http://frame-extractor:8081
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      frame-extractor:
+        condition: service_started
+    volumes:
+      - videos_data:/app/videos
+      - texts_data:/app/texts
+      - frames_data:/app/frames
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time — rebuild the image to change it.
+        NEXT_PUBLIC_API_URL: http://localhost:8734
+    container_name: borntodev-frontend
+    platform: linux/amd64
+    ports:
+      - "4287:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  videos_data:
+  texts_data:
+  frames_data:

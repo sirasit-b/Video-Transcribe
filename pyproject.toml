@@ -1,0 +1,16 @@
+[project]
+name = "video-asr-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi==0.115.5",
+    "imageio-ffmpeg==0.5.1",
+    "openai==1.55.3",
+    "psycopg2-binary==2.9.10",
+    "python-dotenv==1.0.1",
+    "python-multipart==0.0.12",
+    "sqlalchemy==2.0.36",
+    "uvicorn[standard]==0.32.0",
+]

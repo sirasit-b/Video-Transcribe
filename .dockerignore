@@ -1,0 +1,23 @@
+.git
+.gitignore
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Local runtime artifacts
+videos/
+frames/
+texts/
+
+# Rust service build artifacts
+frame-extractor-rs/target/
+
+# Frontend build artifacts
+frontend/.next/
+frontend/node_modules/
+
+# Misc
+build_debug.log
