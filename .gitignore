@@ -14,9 +14,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
-videos/
-texts/
-frames/
+/videos/
+/texts/
+/frames/
 
 *.log
 

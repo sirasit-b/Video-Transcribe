@@ -124,7 +124,10 @@ VIDEOS_DIR.mkdir(exist_ok=True)
 TEXTS_DIR.mkdir(exist_ok=True)
 FRAMES_DIR.mkdir(exist_ok=True)
 
-api_key = os.getenv("OPENAI_API_KEY")
+# Transcription runs on Gemini or OpenAI (per-request model choice); caption rewriting
+# runs on OpenAI only.
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+openai_api_key = os.getenv("OPENAI_API_KEY")
 
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
@@ -209,6 +212,19 @@ class VideoResponse(BaseModel):
 
 class VideoUpdateRequest(BaseModel):
     original_name: str
+
+class CaptionSegmentUpdateRequest(BaseModel):
+    text: str
+
+class TranscribeRequest(BaseModel):
+    model: Optional[str] = None
+
+class TranscribeModel(BaseModel):
+    id: str
+    label: str
+    description: str
+    provider: str
+    is_default: bool
 
 class VideoMoveRequest(BaseModel):
     project_id: Optional[int] = None
@@ -761,10 +777,98 @@ def get_video_captions_srt(
         raise HTTPException(status_code=404, detail="Captions not available")
     return Response(content=pipeline.segments_to_srt(video.caption_segments), media_type="application/x-subrip")
 
+@app.post("/api/videos/{video_id}/captions", response_model=VideoResponse)
+async def upload_captions(
+    video_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    video = _get_owned_video(video_id, db, current_user)
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("cp1252")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="Could not decode the file as text")
+
+    try:
+        segments = pipeline.parse_srt(text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    video.caption_segments = segments
+    video.transcript_text = " ".join(seg["text"] for seg in segments)
+    video.has_transcript = True
+    db.commit()
+    db.refresh(video)
+    return video
+
+@app.patch("/api/videos/{video_id}/captions/{segment_index}", response_model=VideoResponse)
+def update_caption_segment(
+    video_id: int,
+    segment_index: int,
+    payload: CaptionSegmentUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    video = _get_owned_video(video_id, db, current_user)
+
+    segments = video.caption_segments or []
+    if not 0 <= segment_index < len(segments):
+        raise HTTPException(status_code=404, detail="Caption segment not found")
+
+    new_text = payload.text.strip()
+    if not new_text:
+        raise HTTPException(status_code=400, detail="Caption text must not be empty")
+
+    # JSON columns are only flushed when reassigned, so rebuild the list.
+    updated = [dict(seg) for seg in segments]
+    updated[segment_index]["text"] = new_text
+
+    video.caption_segments = updated
+    video.transcript_text = " ".join(seg["text"] for seg in updated)
+    db.commit()
+    db.refresh(video)
+    return video
+
+def _configured_providers() -> set:
+    configured = set()
+    if gemini_api_key:
+        configured.add("gemini")
+    if openai_api_key:
+        configured.add("openai")
+    return configured
+
+@app.get("/api/transcribe-models", response_model=List[TranscribeModel])
+def list_transcribe_models(current_user: models.User = Depends(auth.get_current_user)):
+    # Hide models we have no key for — picking one would only fail at transcribe time.
+    configured = _configured_providers()
+    return [
+        entry
+        for entry in pipeline.available_transcribe_models()
+        if entry["provider"] in configured
+    ]
+
 @app.post("/api/videos/{video_id}/transcribe", response_model=VideoResponse)
-def transcribe_video(video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+def transcribe_video(
+    video_id: int,
+    payload: Optional[TranscribeRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    try:
+        model = pipeline.resolve_transcribe_model(payload.model if payload else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    provider = pipeline.transcribe_model_provider(model)
+    if provider not in _configured_providers():
+        key_name = "OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"
+        raise HTTPException(status_code=500, detail=f"{key_name} is not set (required by {model})")
 
     video = _get_owned_video(video_id, db, current_user)
 
@@ -773,7 +877,13 @@ def transcribe_video(video_id: int, db: Session = Depends(get_db), current_user:
         raise HTTPException(status_code=404, detail="Video file not found on disk")
 
     try:
-        result = pipeline.process_video(str(file_path), api_key, str(TEXTS_DIR))
+        result = pipeline.process_video(
+            str(file_path),
+            gemini_api_key,
+            str(TEXTS_DIR),
+            model=model,
+            openai_api_key=openai_api_key,
+        )
 
         video.has_transcript = True
         video.transcript_text = result["text"]
@@ -783,12 +893,12 @@ def transcribe_video(video_id: int, db: Session = Depends(get_db), current_user:
 
         return video
     except Exception:
-        logger.exception("Transcription failed for video %s", video_id)
-        raise HTTPException(status_code=500, detail="Transcription failed")
+        logger.exception("Transcription failed for video %s (model=%s)", video_id, model)
+        raise HTTPException(status_code=500, detail=f"Transcription failed using {model}")
 
 @app.post("/api/videos/{video_id}/rewrite-captions", response_model=VideoResponse)
 def rewrite_captions(video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
-    if not api_key:
+    if not openai_api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     video = _get_owned_video(video_id, db, current_user)
@@ -796,7 +906,7 @@ def rewrite_captions(video_id: int, db: Session = Depends(get_db), current_user:
         raise HTTPException(status_code=400, detail="No captions to rewrite. Transcribe first.")
 
     try:
-        rewritten = pipeline.rewrite_caption_segments(video.caption_segments, api_key)
+        rewritten = pipeline.rewrite_caption_segments(video.caption_segments, openai_api_key)
         video.caption_segments = rewritten
         video.transcript_text = " ".join(seg["text"] for seg in rewritten)
         db.commit()

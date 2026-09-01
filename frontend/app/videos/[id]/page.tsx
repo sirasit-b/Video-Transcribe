@@ -1,0 +1,951 @@
+"use client";
+
+import { useEffect, useRef, useState, use } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import axios from "axios";
+import {
+  ArrowLeft,
+  FileText,
+  Loader2,
+  AlertCircle,
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  X,
+  Pencil,
+  Check,
+  Sparkles,
+  CheckSquare,
+  Square,
+  Archive,
+  Trash2,
+  Upload,
+} from "lucide-react";
+import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
+
+interface CaptionSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface VideoData {
+  id: number;
+  filename: string;
+  original_name: string;
+  has_transcript: boolean;
+  transcript_text: string | null;
+  caption_segments: CaptionSegment[] | null;
+}
+
+interface TranscribeModel {
+  id: string;
+  label: string;
+  description: string;
+  provider: string;
+  is_default: boolean;
+}
+
+const PROVIDER_LABELS: Record<string, string> = {
+  gemini: "Google Gemini",
+  openai: "OpenAI",
+};
+
+interface FrameItem {
+  filename: string;
+  url: string;
+}
+
+const MODEL_KEY = "vt_transcribe_model";
+
+function formatTimestamp(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function withAuthToken(url: string): string {
+  const token = typeof window !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
+  if (!token) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+}
+
+function triggerBlobDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export default function VideoPage({ params }: { params: Promise<{ id: string }> }) {
+  const resolvedParams = use(params);
+  const videoId = resolvedParams.id;
+  const router = useRouter();
+
+  const [video, setVideo] = useState<VideoData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcribeModels, setTranscribeModels] = useState<TranscribeModel[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
+  const [isRewriting, setIsRewriting] = useState(false);
+  const [isUploadingSrt, setIsUploadingSrt] = useState(false);
+  const [frameCount, setFrameCount] = useState("6");
+  const [isExtractingFrames, setIsExtractingFrames] = useState(false);
+  const [frames, setFrames] = useState<FrameItem[]>([]);
+  const [selectedFrames, setSelectedFrames] = useState<Set<string>>(new Set());
+  const [isDownloadingAll, setIsDownloadingAll] = useState(false);
+  const [isDownloadingSelected, setIsDownloadingSelected] = useState(false);
+  const [activeFrameIndex, setActiveFrameIndex] = useState<number | null>(null);
+
+  const [isRenaming, setIsRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [isSavingName, setIsSavingName] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const srtInputRef = useRef<HTMLInputElement>(null);
+  const cueRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const [activeCueIndex, setActiveCueIndex] = useState<number | null>(null);
+  const [editingCueIndex, setEditingCueIndex] = useState<number | null>(null);
+  const [cueDraft, setCueDraft] = useState("");
+  const [savingCueIndex, setSavingCueIndex] = useState<number | null>(null);
+  const [captionsVersion, setCaptionsVersion] = useState(0);
+
+  const handleTranscribe = async () => {
+    setIsTranscribing(true);
+    setError(null);
+    try {
+      const res = await api.post(`/videos/${videoId}/transcribe`, { model: selectedModel || null });
+      setVideo(res.data);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to transcribe video");
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const handleRewriteCaptions = async () => {
+    setIsRewriting(true);
+    setError(null);
+    try {
+      const res = await api.post(`/videos/${videoId}/rewrite-captions`);
+      setVideo(res.data);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to rewrite captions");
+    } finally {
+      setIsRewriting(false);
+    }
+  };
+
+  const handleSrtFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsUploadingSrt(true);
+    setError(null);
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const res = await api.post(`/videos/${videoId}/captions`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setVideo(res.data);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to upload SRT");
+    } finally {
+      setIsUploadingSrt(false);
+      if (srtInputRef.current) srtInputRef.current.value = "";
+    }
+  };
+
+  const handleDownloadSrt = async () => {
+    try {
+      const res = await api.get(`/videos/${videoId}/captions.srt`, { responseType: "blob" });
+      const base = video?.original_name?.replace(/\.[^.]+$/, "") || `video_${videoId}`;
+      triggerBlobDownload(res.data, `${base}.srt`);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to download SRT");
+    }
+  };
+
+  const handleExtractFrames = async () => {
+    const parsedCount = Number.parseInt(frameCount, 10);
+    if (!Number.isInteger(parsedCount) || parsedCount < 1) {
+      setError("Please enter a frame count of at least 1.");
+      return;
+    }
+
+    setIsExtractingFrames(true);
+    setError(null);
+
+    try {
+      const res = await api.post(`/videos/${videoId}/frames`, { count: parsedCount });
+      setFrames(res.data.frames);
+      setSelectedFrames(new Set());
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to extract frames");
+    } finally {
+      setIsExtractingFrames(false);
+    }
+  };
+
+  const toggleFrameSelection = (filename: string) => {
+    setSelectedFrames((prev) => {
+      const next = new Set(prev);
+      if (next.has(filename)) next.delete(filename);
+      else next.add(filename);
+      return next;
+    });
+  };
+
+  const handleDownloadAllFrames = async () => {
+    setIsDownloadingAll(true);
+    setError(null);
+    try {
+      const res = await api.get(`/videos/${videoId}/frames/download`, { responseType: "blob" });
+      triggerBlobDownload(res.data, `video_${videoId}_frames.zip`);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to download frames");
+    } finally {
+      setIsDownloadingAll(false);
+    }
+  };
+
+  const handleDownloadSelectedFrames = async () => {
+    if (selectedFrames.size === 0) return;
+    setIsDownloadingSelected(true);
+    setError(null);
+    try {
+      const res = await api.post(
+        `/videos/${videoId}/frames/download`,
+        { filenames: Array.from(selectedFrames) },
+        { responseType: "blob" }
+      );
+      triggerBlobDownload(res.data, `video_${videoId}_frames_selected.zip`);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to download selected frames");
+    } finally {
+      setIsDownloadingSelected(false);
+    }
+  };
+
+  const startRenaming = () => {
+    setNameDraft(video?.original_name ?? "");
+    setIsRenaming(true);
+  };
+
+  const handleSaveName = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) {
+      setError("Name must not be empty.");
+      return;
+    }
+    if (trimmed === video?.original_name) {
+      setIsRenaming(false);
+      return;
+    }
+
+    setIsSavingName(true);
+    setError(null);
+    try {
+      const res = await api.patch(`/videos/${videoId}`, { original_name: trimmed });
+      setVideo(res.data);
+      setIsRenaming(false);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to rename video");
+    } finally {
+      setIsSavingName(false);
+    }
+  };
+
+  const handleDeleteVideo = async () => {
+    if (!video || !confirm(`Delete "${video.original_name}"?`)) return;
+    setIsDeleting(true);
+    setError(null);
+    try {
+      await api.delete(`/videos/${videoId}`);
+      router.push("/");
+    } catch (err) {
+      console.error(err);
+      setError("Failed to delete video");
+      setIsDeleting(false);
+    }
+  };
+
+  const seekToCue = (start: number) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = start;
+      videoRef.current.play();
+    }
+  };
+
+  const startEditingCue = (index: number, text: string) => {
+    setEditingCueIndex(index);
+    setCueDraft(text);
+  };
+
+  const cancelEditingCue = () => {
+    setEditingCueIndex(null);
+    setCueDraft("");
+  };
+
+  const handleSaveCue = async (index: number) => {
+    const trimmed = cueDraft.trim();
+    if (!trimmed) {
+      setError("Caption text must not be empty.");
+      return;
+    }
+    if (trimmed === video?.caption_segments?.[index]?.text) {
+      cancelEditingCue();
+      return;
+    }
+
+    setSavingCueIndex(index);
+    setError(null);
+    try {
+      const res = await api.patch(`/videos/${videoId}/captions/${index}`, { text: trimmed });
+      setVideo(res.data);
+      setCaptionsVersion((v) => v + 1);
+      cancelEditingCue();
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to save caption");
+    } finally {
+      setSavingCueIndex(null);
+    }
+  };
+
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      try {
+        const res = await api.get(`/videos/${videoId}`);
+        if (active) setVideo(res.data);
+      } catch (err) {
+        console.error(err);
+        if (active) setError("Failed to load video data.");
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+
+    (async () => {
+      try {
+        const res = await api.get(`/videos/${videoId}/frames`);
+        if (active && res.data.frames.length > 0) setFrames(res.data.frames);
+      } catch (err) {
+        console.error(err);
+      }
+    })();
+
+    (async () => {
+      try {
+        const res = await api.get<TranscribeModel[]>(`/transcribe-models`);
+        if (!active) return;
+        setTranscribeModels(res.data);
+        const stored = localStorage.getItem(MODEL_KEY);
+        const fallback = res.data.find((m) => m.is_default) ?? res.data[0];
+        const initial = res.data.find((m) => m.id === stored) ?? fallback;
+        setSelectedModel(initial?.id ?? "");
+      } catch (err) {
+        console.error(err);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [videoId]);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    const segments = video?.caption_segments;
+    if (!el || !segments?.length) return;
+
+    const handleTimeUpdate = () => {
+      const t = el.currentTime;
+      const idx = segments.findIndex((s) => t >= s.start && t < s.end);
+      setActiveCueIndex(idx === -1 ? null : idx);
+    };
+
+    el.addEventListener("timeupdate", handleTimeUpdate);
+    return () => el.removeEventListener("timeupdate", handleTimeUpdate);
+  }, [video?.caption_segments]);
+
+  useEffect(() => {
+    if (activeCueIndex !== null && editingCueIndex === null) {
+      cueRefs.current[activeCueIndex]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [activeCueIndex, editingCueIndex]);
+
+  useEffect(() => {
+    if (activeFrameIndex === null) {
+      document.body.style.overflow = "";
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setActiveFrameIndex((currentIndex) => {
+          if (currentIndex === null || frames.length === 0) return currentIndex;
+          return (currentIndex - 1 + frames.length) % frames.length;
+        });
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setActiveFrameIndex((currentIndex) => {
+          if (currentIndex === null || frames.length === 0) return currentIndex;
+          return (currentIndex + 1) % frames.length;
+        });
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setActiveFrameIndex(null);
+      }
+    };
+
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [activeFrameIndex, frames.length]);
+
+  const showPreviousFrame = () => {
+    setActiveFrameIndex((currentIndex) => {
+      if (currentIndex === null || frames.length === 0) return currentIndex;
+      return (currentIndex - 1 + frames.length) % frames.length;
+    });
+  };
+
+  const showNextFrame = () => {
+    setActiveFrameIndex((currentIndex) => {
+      if (currentIndex === null || frames.length === 0) return currentIndex;
+      return (currentIndex + 1) % frames.length;
+    });
+  };
+
+  const activeFrame = activeFrameIndex === null ? null : frames[activeFrameIndex];
+
+  if (loading) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-3 text-gray-400 py-24">
+        <Loader2 className="w-6 h-6 animate-spin" strokeWidth={1.5} />
+        <p className="text-sm">Loading video...</p>
+      </div>
+    );
+  }
+
+  if (!video) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-gray-400 gap-3">
+        <AlertCircle className="w-8 h-8" strokeWidth={1.5} />
+        <h2 className="text-lg font-medium text-gray-700">Video not found</h2>
+        <Link href="/" className="text-blue-600 hover:text-blue-700 flex items-center gap-1 text-sm">
+          <ArrowLeft className="w-4 h-4" strokeWidth={1.5} /> Back to videos
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <main className="flex-1 max-w-6xl w-full mx-auto px-8 py-12 flex flex-col gap-10">
+      <div className="flex items-center gap-3">
+        <button
+          onClick={() => window.history.back()}
+          aria-label="Go back"
+          title="Go back"
+          className="p-2 rounded-full hover:bg-gray-100 transition-colors text-gray-500"
+        >
+          <ArrowLeft className="w-5 h-5" strokeWidth={1.5} />
+        </button>
+        {isRenaming ? (
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <input
+              autoFocus
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleSaveName();
+                if (e.key === "Escape") setIsRenaming(false);
+              }}
+              disabled={isSavingName}
+              className="flex-1 min-w-0 text-2xl font-semibold tracking-tight text-gray-900 border-b border-gray-300 focus:border-blue-500 outline-none bg-transparent disabled:opacity-50"
+            />
+            <button
+              onClick={handleSaveName}
+              disabled={isSavingName}
+              aria-label="Save name"
+              title="Save"
+              className="p-2 rounded-full hover:bg-gray-100 transition-colors text-blue-600 disabled:opacity-50"
+            >
+              {isSavingName ? (
+                <Loader2 className="w-5 h-5 animate-spin" strokeWidth={1.5} />
+              ) : (
+                <Check className="w-5 h-5" strokeWidth={1.5} />
+              )}
+            </button>
+            <button
+              onClick={() => setIsRenaming(false)}
+              disabled={isSavingName}
+              aria-label="Cancel rename"
+              title="Cancel"
+              className="p-2 rounded-full hover:bg-gray-100 transition-colors text-gray-500 disabled:opacity-50"
+            >
+              <X className="w-5 h-5" strokeWidth={1.5} />
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <h1 className="text-2xl font-semibold tracking-tight text-gray-900 truncate" title={video.original_name}>
+              {video.original_name}
+            </h1>
+            <button
+              onClick={startRenaming}
+              aria-label="Rename video"
+              title="Rename"
+              className="shrink-0 p-2 rounded-full hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600"
+            >
+              <Pencil className="w-4 h-4" strokeWidth={1.5} />
+            </button>
+            <button
+              onClick={handleDeleteVideo}
+              disabled={isDeleting}
+              aria-label="Delete video"
+              title="Delete"
+              className="shrink-0 p-2 rounded-full hover:bg-red-50 transition-colors text-gray-400 hover:text-red-600 disabled:opacity-50"
+            >
+              {isDeleting ? (
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+              ) : (
+                <Trash2 className="w-4 h-4" strokeWidth={1.5} />
+              )}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <p className="flex items-center gap-2 text-sm text-red-600">
+          <AlertCircle className="w-4 h-4" strokeWidth={1.5} />
+          {error}
+        </p>
+      )}
+
+      {/* Player + captions side by side */}
+      <div className="grid lg:grid-cols-[1fr_380px] gap-8 items-start">
+        <div className="flex flex-col gap-3">
+          <div className="aspect-video bg-black rounded-2xl overflow-hidden">
+            <video
+              ref={videoRef}
+              src={withAuthToken(`${MEDIA_BASE}/api/videos/stream/${video.filename}`)}
+              controls
+              className="w-full h-full object-contain"
+            >
+              {video.has_transcript && (
+                <track
+                  key={captionsVersion}
+                  kind="subtitles"
+                  src={withAuthToken(`${MEDIA_BASE}/api/videos/${videoId}/captions.vtt?v=${captionsVersion}`)}
+                  srcLang="th"
+                  label="Thai"
+                  default
+                />
+              )}
+            </video>
+          </div>
+          <div className="flex flex-wrap justify-between items-center gap-3">
+            <span className="flex items-center gap-1.5 text-sm text-gray-500">
+              <span className={`w-1.5 h-1.5 rounded-full ${video.has_transcript ? "bg-blue-500" : "bg-gray-300"}`} />
+              {video.has_transcript ? "Transcribed" : "Not transcribed"}
+            </span>
+            <div className="flex items-center gap-2">
+              <input
+                ref={srtInputRef}
+                type="file"
+                accept=".srt"
+                className="hidden"
+                onChange={handleSrtFileSelected}
+              />
+              <button
+                onClick={() => srtInputRef.current?.click()}
+                disabled={isUploadingSrt}
+                title={video.has_transcript ? "Upload an SRT file to replace the current captions" : "Upload an SRT file instead of transcribing"}
+                className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                {isUploadingSrt ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : <Upload className="w-4 h-4" strokeWidth={1.5} />}
+                {isUploadingSrt ? "Uploading..." : video.has_transcript ? "Replace SRT" : "Upload SRT"}
+              </button>
+              {!video.has_transcript && transcribeModels.length > 0 && (
+                <select
+                  value={selectedModel}
+                  onChange={(e) => {
+                    setSelectedModel(e.target.value);
+                    localStorage.setItem(MODEL_KEY, e.target.value);
+                  }}
+                  disabled={isTranscribing}
+                  aria-label="Transcription model"
+                  title={transcribeModels.find((m) => m.id === selectedModel)?.description || "Transcription model"}
+                  className="border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 disabled:opacity-50"
+                >
+                  {Array.from(new Set(transcribeModels.map((m) => m.provider))).map((provider) => (
+                    <optgroup key={provider} label={PROVIDER_LABELS[provider] ?? provider}>
+                      {transcribeModels
+                        .filter((m) => m.provider === provider)
+                        .map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.label}
+                            {m.is_default ? " (default)" : ""}
+                          </option>
+                        ))}
+                    </optgroup>
+                  ))}
+                </select>
+              )}
+              {!video.has_transcript && (
+                <button
+                  onClick={handleTranscribe}
+                  disabled={isTranscribing}
+                  className="bg-blue-600 text-white px-5 py-2 rounded-full text-sm font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 transition-colors"
+                >
+                  {isTranscribing ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : <FileText className="w-4 h-4" strokeWidth={1.5} />}
+                  {isTranscribing ? "Transcribing..." : "Transcribe"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Captions panel beside the video */}
+        {(video.has_transcript || isTranscribing) && (
+          <aside className="flex flex-col gap-3 lg:sticky lg:top-24">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold text-gray-900">Captions</h2>
+              {video.has_transcript && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={handleRewriteCaptions}
+                    disabled={isRewriting}
+                    title="Fix typos & rewrite captions with AI"
+                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                  >
+                    {isRewriting ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Sparkles className="w-3.5 h-3.5" strokeWidth={1.5} />}
+                    {isRewriting ? "Rewriting..." : "Rewrite"}
+                  </button>
+                  <button
+                    onClick={handleDownloadSrt}
+                    title="Download SRT"
+                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 transition-colors"
+                  >
+                    <Download className="w-3.5 h-3.5" strokeWidth={1.5} />
+                    SRT
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {isRewriting && (
+              <p className="flex items-center gap-2 text-xs text-blue-600">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+                Fixing typos and rewriting captions...
+              </p>
+            )}
+
+            {video.caption_segments?.length ? (
+              <div className="flex flex-col max-h-[60vh] overflow-y-auto rounded-xl border border-gray-100">
+                {video.caption_segments.map((seg, i) => {
+                  const isEditing = editingCueIndex === i;
+                  const isSavingCue = savingCueIndex === i;
+                  return (
+                    <div
+                      key={i}
+                      ref={(el) => {
+                        cueRefs.current[i] = el;
+                      }}
+                      className={`group px-4 py-2.5 text-sm border-b border-gray-50 last:border-b-0 transition-colors ${
+                        activeCueIndex === i && !isEditing ? "bg-blue-50 text-blue-900" : "text-gray-700"
+                      } ${isEditing ? "bg-white" : "hover:bg-gray-50"}`}
+                    >
+                      {isEditing ? (
+                        <div className="flex flex-col gap-2">
+                          <span className="text-gray-400 tabular-nums text-xs">{formatTimestamp(seg.start)}</span>
+                          <textarea
+                            autoFocus
+                            rows={2}
+                            value={cueDraft}
+                            onChange={(e) => setCueDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && !e.shiftKey) {
+                                e.preventDefault();
+                                handleSaveCue(i);
+                              }
+                              if (e.key === "Escape") cancelEditingCue();
+                            }}
+                            disabled={isSavingCue}
+                            className="w-full resize-y rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 disabled:opacity-50"
+                          />
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => handleSaveCue(i)}
+                              disabled={isSavingCue}
+                              className="flex items-center gap-1.5 bg-blue-600 text-white px-3 py-1.5 rounded-full text-xs font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                            >
+                              {isSavingCue ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+                              ) : (
+                                <Check className="w-3.5 h-3.5" strokeWidth={1.5} />
+                              )}
+                              {isSavingCue ? "Saving..." : "Save"}
+                            </button>
+                            <button
+                              onClick={cancelEditingCue}
+                              disabled={isSavingCue}
+                              className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5" strokeWidth={1.5} />
+                              Cancel
+                            </button>
+                            <span className="text-[11px] text-gray-400">Enter to save, Esc to cancel</span>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex items-start gap-2">
+                          <button
+                            onClick={() => seekToCue(seg.start)}
+                            onDoubleClick={() => startEditingCue(i, seg.text)}
+                            title="Click to jump here, double-click to edit"
+                            className="flex-1 min-w-0 text-left flex gap-3"
+                          >
+                            <span className="text-gray-400 tabular-nums shrink-0">{formatTimestamp(seg.start)}</span>
+                            <span className="whitespace-pre-wrap">{seg.text}</span>
+                          </button>
+                          <button
+                            onClick={() => startEditingCue(i, seg.text)}
+                            aria-label={`Edit caption at ${formatTimestamp(seg.start)}`}
+                            title="Edit text"
+                            className="shrink-0 p-1 rounded-md text-gray-400 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-gray-700 hover:bg-gray-100 transition-all"
+                          >
+                            <Pencil className="w-3.5 h-3.5" strokeWidth={1.5} />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="flex items-center gap-2 text-sm text-gray-500">
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                Transcription in progress. Please wait...
+              </p>
+            )}
+          </aside>
+        )}
+      </div>
+
+      {/* Frame extraction */}
+      <div className="flex flex-col gap-4 pt-8 border-t border-gray-100">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Frames</h2>
+            <p className="text-sm text-gray-500 mt-1">Extract evenly spaced frames from the video.</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={frameCount}
+              onChange={(e) => setFrameCount(e.target.value)}
+              className="w-20 border border-gray-200 rounded-full px-4 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+            />
+            <button
+              onClick={handleExtractFrames}
+              disabled={isExtractingFrames}
+              className="border border-gray-300 text-gray-700 px-5 py-2 rounded-full text-sm font-medium hover:bg-gray-50 disabled:opacity-50 flex items-center gap-2 transition-colors"
+            >
+              {isExtractingFrames ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : <Camera className="w-4 h-4" strokeWidth={1.5} />}
+              {isExtractingFrames ? "Extracting..." : "Extract"}
+            </button>
+          </div>
+        </div>
+
+        {isExtractingFrames && (
+          <p className="flex items-center gap-2 text-sm text-gray-500">
+            <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+            Extracting frames, please wait...
+          </p>
+        )}
+
+        {frames.length > 0 && (
+          <>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                onClick={handleDownloadAllFrames}
+                disabled={isDownloadingAll}
+                className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-full text-sm font-medium hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                {isDownloadingAll ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : <Archive className="w-4 h-4" strokeWidth={1.5} />}
+                {isDownloadingAll ? "Preparing..." : `Download all (${frames.length})`}
+              </button>
+              <button
+                onClick={handleDownloadSelectedFrames}
+                disabled={selectedFrames.size === 0 || isDownloadingSelected}
+                className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+              >
+                {isDownloadingSelected ? <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} /> : <Download className="w-4 h-4" strokeWidth={1.5} />}
+                {isDownloadingSelected ? "Preparing..." : `Download selected (${selectedFrames.size})`}
+              </button>
+              {selectedFrames.size > 0 && (
+                <button
+                  onClick={() => setSelectedFrames(new Set())}
+                  className="text-sm text-gray-500 hover:text-gray-700 transition-colors"
+                >
+                  Clear selection
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 pt-1">
+              {frames.map((frame, index) => {
+                const selected = selectedFrames.has(frame.filename);
+                return (
+                  <div
+                    key={frame.filename}
+                    className={`relative rounded-xl overflow-hidden bg-gray-50 aspect-video group ring-2 transition-all ${
+                      selected ? "ring-blue-500" : "ring-transparent"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setActiveFrameIndex(index)}
+                      className="w-full h-full"
+                      aria-label={`Open extracted frame ${index + 1}`}
+                    >
+                      <img
+                        src={withAuthToken(`${MEDIA_BASE}${frame.url}`)}
+                        alt={`Extracted frame ${index + 1}`}
+                        className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
+                      />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleFrameSelection(frame.filename)}
+                      aria-label={selected ? "Deselect frame" : "Select frame"}
+                      className={`absolute top-2 left-2 p-1 rounded-md backdrop-blur transition-colors ${
+                        selected ? "bg-blue-600 text-white" : "bg-black/40 text-white hover:bg-black/60"
+                      }`}
+                    >
+                      {selected ? <CheckSquare className="w-4 h-4" strokeWidth={1.5} /> : <Square className="w-4 h-4" strokeWidth={1.5} />}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+
+      {activeFrame && (
+        <div
+          className="fixed inset-0 z-50 bg-black/90 p-4 sm:p-8 flex items-center justify-center"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Extracted frame ${activeFrameIndex! + 1}`}
+          onClick={() => setActiveFrameIndex(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setActiveFrameIndex(null)}
+            className="absolute top-4 right-4 sm:top-6 sm:right-6 p-2 rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors"
+            aria-label="Close image viewer"
+          >
+            <X className="w-5 h-5" strokeWidth={1.5} />
+          </button>
+
+          {frames.length > 1 && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                showPreviousFrame();
+              }}
+              className="absolute left-3 sm:left-6 p-3 rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors"
+              aria-label="View previous image"
+            >
+              <ChevronLeft className="w-6 h-6" strokeWidth={1.5} />
+            </button>
+          )}
+
+          <div
+            className="relative w-full max-w-6xl max-h-full flex flex-col gap-4 items-center"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <img
+              src={withAuthToken(`${MEDIA_BASE}${activeFrame.url}`)}
+              alt={`Extracted frame ${activeFrameIndex! + 1}`}
+              className="max-w-full max-h-[75vh] object-contain rounded-2xl"
+            />
+
+            <div className="w-full max-w-4xl rounded-2xl bg-white/10 backdrop-blur px-4 py-3 text-white flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium">Frame {activeFrameIndex! + 1} of {frames.length}</p>
+                <p className="text-sm text-white/60 break-all">{activeFrame.filename}</p>
+              </div>
+              <a
+                href={withAuthToken(`${MEDIA_BASE}${activeFrame.url}`)}
+                download={activeFrame.filename}
+                className="inline-flex items-center justify-center gap-2 rounded-full border border-white/20 text-white px-4 py-2 text-sm font-medium hover:bg-white/10 transition-colors"
+              >
+                <Download className="w-4 h-4" strokeWidth={1.5} />
+                Download
+              </a>
+            </div>
+          </div>
+
+          {frames.length > 1 && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                showNextFrame();
+              }}
+              className="absolute right-3 sm:right-6 p-3 rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors"
+              aria-label="View next image"
+            >
+              <ChevronRight className="w-6 h-6" strokeWidth={1.5} />
+            </button>
+          )}
+        </div>
+      )}
+    </main>
+  );
+}

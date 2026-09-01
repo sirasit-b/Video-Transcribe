@@ -8,7 +8,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Backend: FastAPI + SQLAlchemy
 - Database: PostgreSQL 15
 - Media processing: FFmpeg, with frame extraction offloaded to a Rust service in Docker
-- AI: OpenAI (`whisper-1`, for timestamped Thai transcription)
+- AI: Google Gemini (`gemini-3.5-flash`, timestamped Thai transcription) or OpenAI (`gpt-transcribe`, `whisper-1`, ...), picked per run; OpenAI `gpt-5` for caption proofreading
 
 ## Project Structure
 
@@ -31,8 +31,9 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Upload videos directly, no grouping required
 - Stream uploaded videos
 - Extract evenly spaced frames from videos
-- Transcribe video audio to Thai text with per-segment timestamps
+- Transcribe video audio to Thai text with per-segment timestamps (Gemini), choosing the model per run
 - Preview synced captions alongside video playback (click-to-seek cue list + native subtitle track)
+- Edit any caption line by hand to fix ASR typos
 
 ## Prerequisites
 
@@ -48,7 +49,21 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 Create `.env` in the project root:
 
 ```env
+# Transcription
+GEMINI_API_KEY=your_gemini_api_key
+# Optional override (default: gemini-3.5-flash). The model must support both audio
+# input and JSON mode; the gemini-*-transcribe family does not. gemini-3.1-pro-preview
+# works only on a billing-enabled project.
+# GEMINI_TRANSCRIBE_MODEL=gemini-3.1-pro-preview
+# Extra ids for the UI model picker, comma-separated.
+# GEMINI_TRANSCRIBE_MODELS=gemini-2.5-flash,gemini-2.5-pro
+# OPENAI_TRANSCRIBE_MODELS=gpt-4o-transcribe-diarize
+# Default model for the picker, across providers (OpenAI ids allowed).
+# TRANSCRIBE_MODEL=gpt-transcribe
+
+# Only needed for POST /api/videos/{id}/rewrite-captions
 OPENAI_API_KEY=your_openai_api_key
+
 # Optional when running backend outside docker:
 # DATABASE_URL=postgresql://user:password@localhost:6879/borntodev_db
 ```
@@ -116,21 +131,43 @@ Base URL: `http://localhost:8734`
 - `POST /api/videos/{video_id}/frames` - extract frames for a video
 - `GET /api/videos/{video_id}/frames` - list extracted frames
 - `GET /api/videos/{video_id}/frames/{frame_filename}` - fetch an extracted frame
-- `POST /api/videos/{video_id}/transcribe` - generate transcript + caption segments
+- `GET /api/transcribe-models` - transcription models the UI can offer
+- `POST /api/videos/{video_id}/transcribe` - generate transcript + caption segments (optional body: `{"model": "<id>"}`)
 - `GET /api/videos/{video_id}/captions.vtt` - WebVTT captions (for the video `<track>` element)
 - `GET /api/videos/{video_id}/captions.srt` - SRT captions (download)
+- `PATCH /api/videos/{video_id}/captions/{segment_index}` - edit one caption line (`{"text": "..."}`)
 
 Interactive docs:
 
 - Swagger UI: `/docs`
 - ReDoc: `/redoc`
 
+## Transcription Models
+
+The model is chosen per run from the picker on the video page; `GET /api/transcribe-models`
+lists what the configured API keys allow.
+
+| Model | Provider | Timestamps | Notes |
+|---|---|---|---|
+| `gemini-3.5-flash` | Gemini | native | Default. Works on a free-tier key. |
+| `gemini-3.1-pro-preview` | Gemini | native | Needs a billing-enabled project. |
+| `gpt-transcribe` | OpenAI | derived | Most accurate on Thai in our testing. |
+| `gpt-4o-transcribe` | OpenAI | derived | Previous generation. |
+| `gpt-4o-mini-transcribe` | OpenAI | derived | Cheapest. |
+| `whisper-1` | OpenAI | native | Weakest text; returns its own segment timings. |
+
+The `gpt-*transcribe` models reject `response_format=verbose_json` and return text with
+no timings at all. For those, `pipeline._silence_cue_bounds()` cuts the audio into
+2-12s windows in the middle of pauses found by ffmpeg `silencedetect`, transcribes each
+window separately, and takes the cue timing from the cut points.
+
 ## Typical Workflow
 
 1. Upload a video from the homepage.
-2. Open the video page and trigger transcription.
+2. Open the video page, pick a transcription model, and trigger transcription.
 3. Preview the synced caption list, or toggle native subtitles on the player.
-4. Extract frames as needed.
+4. Click the pencil (or double-click a cue) to hand-fix any mis-transcribed line.
+5. Extract frames as needed.
 
 ## Troubleshooting
 
@@ -151,8 +188,21 @@ Interactive docs:
     docker compose logs backend
     ```
 
-- OpenAI key error (`OPENAI_API_KEY is not set`):
-  - Ensure `.env` exists in root and contains a valid key.
+- Transcription key error (`GEMINI_API_KEY is not set`):
+  - Ensure `.env` exists in root and contains a valid Gemini API key.
+
+- Transcription fails with `429 RESOURCE_EXHAUSTED ... limit: 0`:
+  - The configured model is not available on the Gemini free tier (this is the case for
+    `gemini-3.1-pro-preview`). Enable billing on the key's Google Cloud project, or stay
+    on the default `gemini-3.5-flash`.
+
+- Transcription fails with `400 JSON mode is not enabled for this model`:
+  - The model in `GEMINI_TRANSCRIBE_MODEL` does not support structured output. The
+    dedicated `gemini-*-transcribe` models fall in this group; use a flash/pro model.
+
+- Caption rewrite key error (`OPENAI_API_KEY is not set`):
+  - `/rewrite-captions` always needs it, and so does transcription when an OpenAI model
+    is picked; Gemini models do not.
 
 ## Notes
 
