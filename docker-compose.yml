@@ -38,8 +38,7 @@ services:
     ports:
       - "8734:8000"
     environment:
-      # Everything else (JWT_SECRET_KEY, APP_ENV, FRONTEND_ORIGINS, GEMINI_API_KEY,
-      # OPENAI_API_KEY,
+      # Everything else (JWT_SECRET_KEY, APP_ENV, FRONTEND_ORIGINS, OPENAI_API_KEY,
       # WEB_CONCURRENCY, ...) comes from env_file below.
       - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-borntodev_db}
       - FRAME_EXTRACTOR_URL=http://frame-extractor:8081

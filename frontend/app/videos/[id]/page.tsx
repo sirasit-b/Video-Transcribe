@@ -17,6 +17,10 @@ import {
   Pencil,
   Check,
   Sparkles,
+  Wand2,
+  Clock,
+  DollarSign,
+  BookMarked,
   CheckSquare,
   Square,
   Archive,
@@ -31,6 +35,59 @@ interface CaptionSegment {
   text: string;
 }
 
+interface RunStats {
+  operation?: string;
+  model: string;
+  audio_seconds?: number;
+  elapsed_seconds: number;
+  estimated_cost_usd: number;
+  cost_basis: string;
+  is_estimate_only?: boolean;
+  requests?: number;
+  realtime_factor?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+interface Correction {
+  before: string;
+  after: string;
+  category: string;
+  category_label: string;
+  rule_id: string;
+}
+
+interface RuleSummary {
+  rule_id: string;
+  after: string;
+  category: string;
+  category_label: string;
+  count: number;
+  variants: [string, number][];
+}
+
+interface PolishReport {
+  segments_in: number;
+  segments_out: number;
+  correction_count: number;
+  by_category: Record<string, number>;
+  by_rule: RuleSummary[];
+  corrections: { index: number; before: string; after: string; corrections: Correction[] }[];
+  timing_issues: { kind: string; text: string }[];
+  line_split_count: number;
+  tokenizer: string;
+  line_budget?: { min: number; max: number };
+}
+
+interface TranscribeEstimate {
+  model: string;
+  audio_seconds: number;
+  estimated_seconds: number;
+  estimated_cost_usd: number;
+  basis: string;
+  is_estimate_only: boolean;
+}
+
 interface VideoData {
   id: number;
   filename: string;
@@ -38,6 +95,9 @@ interface VideoData {
   has_transcript: boolean;
   transcript_text: string | null;
   caption_segments: CaptionSegment[] | null;
+  transcribe_stats: RunStats | null;
+  polish_report: PolishReport | null;
+  rewrite_stats: RunStats | null;
 }
 
 interface TranscribeModel {
@@ -49,9 +109,70 @@ interface TranscribeModel {
 }
 
 const PROVIDER_LABELS: Record<string, string> = {
-  gemini: "Google Gemini",
   openai: "OpenAI",
 };
+
+// Same palette as the glossary page, so a category reads the same in both places.
+const CATEGORY_STYLES: Record<string, string> = {
+  symbol: "bg-rose-50 text-rose-700 border-rose-200",
+  ui: "bg-orange-50 text-orange-700 border-orange-200",
+  filename: "bg-amber-50 text-amber-700 border-amber-200",
+  path: "bg-lime-50 text-lime-700 border-lime-200",
+  platform: "bg-sky-50 text-sky-700 border-sky-200",
+  term: "bg-violet-50 text-violet-700 border-violet-200",
+  english: "bg-blue-50 text-blue-700 border-blue-200",
+};
+
+function categoryClass(category: string): string {
+  return CATEGORY_STYLES[category] ?? "bg-gray-50 text-gray-600 border-gray-200";
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+function formatCost(usd: number): string {
+  // Runs are routinely well under a cent, so a flat 2dp would show "$0.00".
+  if (usd === 0) return "$0";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
+
+/** Split a caption line so the words the word system replaced can be marked. */
+function highlightSegments(text: string, corrections: Correction[]): { text: string; category?: string }[] {
+  if (!corrections.length) return [{ text }];
+
+  // Longest replacement first: "Roboflow Universe" must win over "Roboflow".
+  const terms = Array.from(new Set(corrections.map((c) => c.after)))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  const categoryOf = new Map(corrections.map((c) => [c.after, c.category]));
+
+  const parts: { text: string; category?: string }[] = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    let matched: string | null = null;
+    for (const term of terms) {
+      if (text.startsWith(term, cursor)) {
+        matched = term;
+        break;
+      }
+    }
+    if (matched) {
+      parts.push({ text: matched, category: categoryOf.get(matched) });
+      cursor += matched.length;
+    } else {
+      const last = parts[parts.length - 1];
+      if (last && last.category === undefined) last.text += text[cursor];
+      else parts.push({ text: text[cursor] });
+      cursor += 1;
+    }
+  }
+  return parts;
+}
 
 interface FrameItem {
   filename: string;
@@ -96,6 +217,9 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [transcribeModels, setTranscribeModels] = useState<TranscribeModel[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
   const [isRewriting, setIsRewriting] = useState(false);
+  const [isPolishing, setIsPolishing] = useState(false);
+  const [estimate, setEstimate] = useState<TranscribeEstimate | null>(null);
+  const [showReport, setShowReport] = useState(false);
   const [isUploadingSrt, setIsUploadingSrt] = useState(false);
   const [frameCount, setFrameCount] = useState("6");
   const [isExtractingFrames, setIsExtractingFrames] = useState(false);
@@ -125,6 +249,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     try {
       const res = await api.post(`/videos/${videoId}/transcribe`, { model: selectedModel || null });
       setVideo(res.data);
+      setCaptionsVersion((v) => v + 1);
     } catch (err) {
       console.error(err);
       const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
@@ -134,12 +259,31 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     }
   };
 
+  const handlePolishCaptions = async () => {
+    setIsPolishing(true);
+    setError(null);
+    try {
+      const res = await api.post(`/videos/${videoId}/polish-captions`);
+      setVideo(res.data);
+      setCaptionsVersion((v) => v + 1);
+      setShowReport(true);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to polish captions");
+    } finally {
+      setIsPolishing(false);
+    }
+  };
+
   const handleRewriteCaptions = async () => {
     setIsRewriting(true);
     setError(null);
     try {
       const res = await api.post(`/videos/${videoId}/rewrite-captions`);
       setVideo(res.data);
+      setCaptionsVersion((v) => v + 1);
+      setShowReport(true);
     } catch (err) {
       console.error(err);
       const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
@@ -381,6 +525,31 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
       active = false;
     };
   }, [videoId]);
+
+  // Pre-flight estimate for the chosen model, so the cost is on screen before the
+  // click. Only meaningful while the video has no transcript yet.
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      if (!selectedModel || video?.has_transcript) {
+        if (active) setEstimate(null);
+        return;
+      }
+      try {
+        const res = await api.get<TranscribeEstimate>(
+          `/videos/${videoId}/transcribe-estimate`,
+          { params: { model: selectedModel } }
+        );
+        if (active) setEstimate(res.data);
+      } catch (err) {
+        console.error(err);
+        if (active) setEstimate(null);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [videoId, selectedModel, video?.has_transcript]);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -642,6 +811,58 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
               )}
             </div>
           </div>
+
+          {/* Projected time and cost before the run */}
+          {!video.has_transcript && !isTranscribing && estimate?.model === selectedModel && (
+            <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
+              <span className="flex items-center gap-1">
+                <Clock className="w-3.5 h-3.5" strokeWidth={1.5} />
+                ประมาณ {formatDuration(estimate.estimated_seconds)}
+              </span>
+              <span className="flex items-center gap-1">
+                <DollarSign className="w-3.5 h-3.5" strokeWidth={1.5} />
+                ประมาณ {formatCost(estimate.estimated_cost_usd)}
+              </span>
+              <span className="text-gray-400">
+                เสียง {formatDuration(estimate.audio_seconds)} · {estimate.basis}
+                {estimate.is_estimate_only ? " · ราคายังไม่ยืนยัน" : ""}
+              </span>
+            </p>
+          )}
+
+          {/* What the run actually cost */}
+          {video.transcribe_stats && (
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-gray-50 px-4 py-2.5 text-xs text-gray-600">
+              <span className="font-medium text-gray-900">{video.transcribe_stats.model}</span>
+              <span className="flex items-center gap-1">
+                <Clock className="w-3.5 h-3.5" strokeWidth={1.5} />
+                {formatDuration(video.transcribe_stats.elapsed_seconds)}
+                {video.transcribe_stats.realtime_factor
+                  ? ` (${video.transcribe_stats.realtime_factor}x realtime)`
+                  : ""}
+              </span>
+              <span className="flex items-center gap-1">
+                <DollarSign className="w-3.5 h-3.5" strokeWidth={1.5} />
+                {formatCost(video.transcribe_stats.estimated_cost_usd)}
+              </span>
+              {video.transcribe_stats.audio_seconds ? (
+                <span className="text-gray-400">
+                  เสียง {formatDuration(video.transcribe_stats.audio_seconds)}
+                </span>
+              ) : null}
+              {video.transcribe_stats.requests ? (
+                <span className="text-gray-400">{video.transcribe_stats.requests} requests</span>
+              ) : null}
+              <span className="text-gray-400">· {video.transcribe_stats.cost_basis} (ประมาณการ)</span>
+              {video.rewrite_stats && (
+                <span className="text-gray-400">
+                  · rewrite {video.rewrite_stats.model}{" "}
+                  {formatDuration(video.rewrite_stats.elapsed_seconds)}{" "}
+                  {formatCost(video.rewrite_stats.estimated_cost_usd)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Captions panel beside the video */}
@@ -652,8 +873,17 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
               {video.has_transcript && (
                 <div className="flex items-center gap-1.5">
                   <button
+                    onClick={handlePolishCaptions}
+                    disabled={isPolishing || isRewriting}
+                    title="แก้คำผิดตามระบบคำ + ตัดบรรทัดสั้น + จัดเวลา (ไม่มีค่าใช้จ่าย)"
+                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                  >
+                    {isPolishing ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Wand2 className="w-3.5 h-3.5" strokeWidth={1.5} />}
+                    {isPolishing ? "Polishing..." : "Polish"}
+                  </button>
+                  <button
                     onClick={handleRewriteCaptions}
-                    disabled={isRewriting}
+                    disabled={isRewriting || isPolishing}
                     title="Fix typos & rewrite captions with AI"
                     className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
                   >
@@ -679,11 +909,96 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
               </p>
             )}
 
+            {isPolishing && (
+              <p className="flex items-center gap-2 text-xs text-blue-600">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+                แก้คำผิด ตัดบรรทัด และจัดเวลาใหม่...
+              </p>
+            )}
+
+            {/* What the clean-up pass changed */}
+            {video.polish_report && (
+              <div className="flex flex-col gap-2 rounded-xl border border-gray-100 bg-gray-50/60 px-4 py-3">
+                <button
+                  onClick={() => setShowReport((v) => !v)}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-left text-xs text-gray-600"
+                >
+                  <span className="font-medium text-gray-900">
+                    แก้คำ {video.polish_report.correction_count} จุด
+                  </span>
+                  <span className="text-gray-400">
+                    · {video.polish_report.segments_in} → {video.polish_report.segments_out} บรรทัด
+                    {video.polish_report.line_budget
+                      ? ` (${video.polish_report.line_budget.min}-${video.polish_report.line_budget.max} ตัวอักษร)`
+                      : ""}
+                  </span>
+                  {video.polish_report.timing_issues.length > 0 && (
+                    <span className="text-gray-400">
+                      · จัดเวลา {video.polish_report.timing_issues.length} จุด
+                    </span>
+                  )}
+                  <span className="text-blue-600">{showReport ? "ซ่อน" : "ดูรายละเอียด"}</span>
+                </button>
+
+                {showReport && (
+                  <div className="flex flex-col gap-3">
+                    {video.polish_report.by_rule.length > 0 ? (
+                      <div className="flex flex-col gap-1.5">
+                        {video.polish_report.by_rule.map((rule) => (
+                          <div key={rule.rule_id} className="flex flex-wrap items-center gap-1.5 text-xs">
+                            <span
+                              title={rule.category_label}
+                              className={`rounded-full border px-2 py-0.5 ${categoryClass(rule.category)}`}
+                            >
+                              {rule.after}
+                            </span>
+                            <span className="text-gray-400">←</span>
+                            {rule.variants.map(([before, count]) => (
+                              <span key={before} className="text-gray-500">
+                                <s className="opacity-70">{before}</s>
+                                {count > 1 ? ` ×${count}` : ""}
+                              </span>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-400">ไม่พบคำที่ต้องแก้</p>
+                    )}
+                    {video.polish_report.timing_issues.length > 0 && (
+                      <p className="text-[11px] text-gray-400">
+                        แก้ timestamp:{" "}
+                        {video.polish_report.timing_issues.filter((i) => i.kind === "overlap").length} ทับซ้อน,{" "}
+                        {video.polish_report.timing_issues.filter((i) => i.kind === "zero_duration").length} เวลา 0 วินาที
+                      </p>
+                    )}
+                    <p className="text-[11px] text-gray-400">
+                      tokenizer: {video.polish_report.tokenizer} ·{" "}
+                      <Link href="/glossary" className="text-blue-600 hover:underline">
+                        จัดการระบบคำ
+                      </Link>
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
             {video.caption_segments?.length ? (
               <div className="flex flex-col max-h-[60vh] overflow-y-auto rounded-xl border border-gray-100">
                 {video.caption_segments.map((seg, i) => {
                   const isEditing = editingCueIndex === i;
                   const isSavingCue = savingCueIndex === i;
+                  // Line splitting renumbers cues, so match the report's corrections
+                  // by the text that is actually on this line.
+                  const lineCorrections = (video.polish_report?.by_rule ?? [])
+                    .filter((rule) => seg.text.includes(rule.after))
+                    .map((rule) => ({
+                      before: rule.variants[0]?.[0] ?? "",
+                      after: rule.after,
+                      category: rule.category,
+                      category_label: rule.category_label,
+                      rule_id: rule.rule_id,
+                    }));
                   return (
                     <div
                       key={i}
@@ -745,7 +1060,23 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                             className="flex-1 min-w-0 text-left flex gap-3"
                           >
                             <span className="text-gray-400 tabular-nums shrink-0">{formatTimestamp(seg.start)}</span>
-                            <span className="whitespace-pre-wrap">{seg.text}</span>
+                            <span className="whitespace-pre-wrap">
+                              {highlightSegments(seg.text, lineCorrections).map((part, k) =>
+                                part.category ? (
+                                  <mark
+                                    key={k}
+                                    title={`แก้จาก: ${
+                                      lineCorrections.find((c) => c.after === part.text)?.before ?? ""
+                                    }`}
+                                    className={`rounded px-0.5 border-b ${categoryClass(part.category)}`}
+                                  >
+                                    {part.text}
+                                  </mark>
+                                ) : (
+                                  <span key={k}>{part.text}</span>
+                                )
+                              )}
+                            </span>
                           </button>
                           <button
                             onClick={() => startEditingCue(i, seg.text)}
