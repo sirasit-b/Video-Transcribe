@@ -6,42 +6,29 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
 from openai import BadRequestError, OpenAI
 from dotenv import load_dotenv
+
+import caption_polish
+import pricing
+from glossary import Glossary
 
 logger = logging.getLogger("pipeline")
 
 
-# gemini-3.1-pro-preview is the stronger model but is unavailable on the Gemini free
-# tier (quota 0, every request 429s), so the default is the flash model that works on
-# an unbilled key. Any override must support audio input AND JSON mode — the dedicated
-# gemini-*-transcribe family does not.
-GEMINI_TRANSCRIBE_MODEL = os.getenv("GEMINI_TRANSCRIBE_MODEL", "gemini-3.5-flash")
+# Transcription is OpenAI-only. TRANSCRIBE_MODEL overrides the default model id.
+DEFAULT_TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL") or "gpt-transcribe"
 
-# TRANSCRIBE_MODEL picks the default across providers; GEMINI_TRANSCRIBE_MODEL is the
-# older, Gemini-only name and still works.
-DEFAULT_TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL") or GEMINI_TRANSCRIBE_MODEL
-
-# Models offered in the UI picker. Only whisper-1 returns timestamps of its own on the
-# OpenAI side; the gpt-*transcribe models are text-only, so we cut cues on silence and
-# take the timing from the cut points (see _transcribe_with_openai).
+# Models offered in the UI picker. Only whisper-1 returns timestamps of its own; the
+# gpt-*transcribe models are text-only, so we cut cues on silence and take the timing
+# from the cut points (see _transcribe_with_openai).
 _MODEL_CATALOG: dict[str, dict] = {
-	"gemini-3.5-flash": {
-		"provider": "gemini",
-		"description": "Fast and cheap. Works on a free-tier key.",
-	},
-	"gemini-3.1-pro-preview": {
-		"provider": "gemini",
-		"description": "Higher accuracy, slower. Needs a billing-enabled key.",
-	},
 	"gpt-transcribe": {
 		"provider": "openai",
 		"description": "Most accurate on Thai. Cues are cut on silence.",
@@ -65,7 +52,7 @@ _OPENAI_NATIVE_TIMESTAMPS = {"whisper-1"}
 
 
 def _model_label(model_id: str) -> str:
-	return model_id.replace("gemini-", "gemini ").replace("-", " ").title()
+	return model_id.replace("-", " ").title()
 
 
 def _extra_model_ids(env_var: str, provider: str) -> list[tuple[str, str]]:
@@ -79,12 +66,9 @@ def _extra_model_ids(env_var: str, provider: str) -> list[tuple[str, str]]:
 def available_transcribe_models() -> list[dict]:
 	"""Model ids the transcriber accepts, default first."""
 	providers = {model_id: entry["provider"] for model_id, entry in _MODEL_CATALOG.items()}
-	for model_id, provider in _extra_model_ids("GEMINI_TRANSCRIBE_MODELS", "gemini"):
-		providers.setdefault(model_id, provider)
 	for model_id, provider in _extra_model_ids("OPENAI_TRANSCRIBE_MODELS", "openai"):
 		providers.setdefault(model_id, provider)
-	# An unknown default is assumed to be Gemini — that env var predates OpenAI support.
-	providers.setdefault(DEFAULT_TRANSCRIBE_MODEL, "gemini")
+	providers.setdefault(DEFAULT_TRANSCRIBE_MODEL, "openai")
 
 	ids = sorted(providers, key=lambda model_id: model_id != DEFAULT_TRANSCRIBE_MODEL)
 	return [
@@ -94,6 +78,10 @@ def available_transcribe_models() -> list[dict]:
 			"description": _MODEL_CATALOG.get(model_id, {}).get("description", ""),
 			"provider": providers[model_id],
 			"is_default": model_id == DEFAULT_TRANSCRIBE_MODEL,
+			# Cost/speed for one minute of audio, so the picker can show the trade-off
+			# before a model is chosen.
+			"estimated_cost_per_minute_usd": pricing.estimate_cost(model_id, 60.0),
+			"estimated_seconds_per_minute": pricing.estimate_seconds(model_id, 60.0),
 		}
 		for model_id in ids
 	]
@@ -112,11 +100,11 @@ def resolve_transcribe_model(model: str | None) -> str:
 
 
 def transcribe_model_provider(model: str) -> str:
-	"""Which API a model id belongs to: 'gemini' or 'openai'."""
+	"""Which API a model id belongs to. Only 'openai' today."""
 	for entry in available_transcribe_models():
 		if entry["id"] == model:
 			return entry["provider"]
-	return "gemini"
+	return "openai"
 
 
 def _ffmpeg_exe() -> str:
@@ -133,7 +121,8 @@ def extract_audio_to_mp3(input_video: str, output_mp3: str | None = None) -> str
 
 	out_path = Path(output_mp3) if output_mp3 else input_path.with_suffix(".mp3")
 
-	# Gemini downsamples audio to 16kHz mono anyway, so downmix here to shrink the upload payload.
+	# The ASR models downsample to 16kHz mono anyway, so downmix here to shrink the
+	# upload payload and stay clear of the 25MB request cap.
 	ffmpeg_exe = _ffmpeg_exe()
 	cmd = [
 		ffmpeg_exe,
@@ -278,127 +267,8 @@ def extract_evenly_spaced_frames_via_service(
 	return frame_paths
 
 
-_TRANSCRIPT_SCHEMA = {
-	"type": "object",
-	"properties": {
-		"segments": {
-			"type": "array",
-			"items": {
-				"type": "object",
-				"properties": {
-					"start": {"type": "string"},
-					"end": {"type": "string"},
-					"text": {"type": "string"},
-				},
-				"required": ["start", "end", "text"],
-				"propertyOrdering": ["start", "end", "text"],
-			},
-		},
-	},
-	"required": ["segments"],
-}
-
-# The whole pipeline is Thai-only today; both APIs take the same ISO code.
+# The whole pipeline is Thai-only today; the API takes an ISO code.
 TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "th")
-
-_TRANSCRIBE_PROMPT = """Transcribe the Thai speech in this audio clip into subtitle segments.
-Rules:
-- Transcribe verbatim in Thai script. Never translate, summarise, or add commentary.
-- Split on natural pauses; keep each segment under roughly 15 words.
-- 'start' and 'end' are timestamps measured from the beginning of THIS clip, formatted as MM:SS.mmm (for example 00:03.480).
-- Segments must be in chronological order and must not overlap.
-- Emit nothing for silence, music, or background noise.
-- If the clip contains no speech, return an empty segments list."""
-
-
-def _parse_timestamp(value: object) -> float:
-	"""Accept 'H:MM:SS.mmm', 'MM:SS.mmm', 'SS.mmm', or a raw number of seconds."""
-	if isinstance(value, (int, float)):
-		return float(value)
-
-	raw = str(value or "").strip()
-	if not raw:
-		return 0.0
-
-	try:
-		numbers = [float(part) for part in raw.split(":")]
-	except ValueError:
-		return 0.0
-
-	total = 0.0
-	for number in numbers:
-		total = total * 60 + number
-	return total
-
-
-# A model is added here the first time it rejects thinking_config, then skipped for
-# the rest of the process so we only pay for that discovery once per model.
-_THINKING_UNSUPPORTED: set[str] = set()
-
-
-def _generation_config(with_thinking: bool) -> types.GenerateContentConfig:
-	return types.GenerateContentConfig(
-		response_mime_type="application/json",
-		response_schema=_TRANSCRIPT_SCHEMA,
-		# Transcription needs no deliberation, and LOW keeps per-chunk latency near what
-		# whisper-1 cost us. Temperature is deliberately left at the Gemini 3 default —
-		# Google warns that lowering it on this family induces looping.
-		thinking_config=types.ThinkingConfig(thinking_level="LOW") if with_thinking else None,
-	)
-
-
-def _transcribe_chunk(client: genai.Client, audio_path: str, model: str) -> tuple[str, list[dict]]:
-	# Chunks are 32kbps mono mp3, so even a 5-minute one stays far below the 20MB
-	# inline-request ceiling — no Files API round trip needed.
-	audio_bytes = Path(audio_path).read_bytes()
-
-	contents = [
-		types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"),
-		_TRANSCRIBE_PROMPT,
-	]
-
-	with_thinking = model not in _THINKING_UNSUPPORTED
-	try:
-		response = client.models.generate_content(
-			model=model,
-			contents=contents,
-			config=_generation_config(with_thinking=with_thinking),
-		)
-	except genai_errors.ClientError as exc:
-		# The dedicated *-transcribe models reject thinking_config with a 400. Learn that
-		# from the response instead of hard-coding a model allowlist, so the model stays
-		# a free choice.
-		if not with_thinking or "hinking" not in str(exc):
-			raise
-		_THINKING_UNSUPPORTED.add(model)
-		response = client.models.generate_content(
-			model=model,
-			contents=contents,
-			config=_generation_config(with_thinking=False),
-		)
-
-	body = response.text
-	if not body:
-		# Empty candidate — usually a safety block or a chunk that is pure silence.
-		return "", []
-
-	data = json.loads(body)
-
-	segments: list[dict] = []
-	previous_end = 0.0
-	for item in data.get("segments", []):
-		text = str(item.get("text", "")).strip()
-		if not text:
-			continue
-		# Clamping to previous_end repairs the occasional overlapping span.
-		start = max(_parse_timestamp(item.get("start")), previous_end)
-		end = _parse_timestamp(item.get("end"))
-		if end <= start:
-			end = start + 1.0
-		segments.append({"start": start, "end": end, "text": text})
-		previous_end = end
-
-	return " ".join(seg["text"] for seg in segments), segments
 
 
 def _split_audio_into_chunks(audio_path: str, chunk_seconds: int, out_dir: str) -> list[Path]:
@@ -540,7 +410,7 @@ def _transcribe_with_openai(
 		# 100 minutes, but chunking also keeps its timestamp drift bounded.
 		if duration <= chunk_seconds * 1.5:
 			text, segments = _openai_native_segments(client, audio_path, model)
-			return {"text": text, "segments": segments}
+			return {"text": text, "segments": segments, "usage": {"requests": 1}}
 
 		with tempfile.TemporaryDirectory() as chunk_dir:
 			chunks = _split_audio_into_chunks(audio_path, chunk_seconds, chunk_dir)
@@ -578,12 +448,12 @@ def _transcribe_with_openai(
 						"text": seg["text"],
 					}
 				)
-		return {"text": " ".join(texts), "segments": merged}
+		return {"text": " ".join(texts), "segments": merged, "usage": {"requests": len(chunks)}}
 
 	# Text-only models: one request per silence-bounded cue, timing from the cut points.
 	windows = _silence_cue_bounds(audio_path)
 	if not windows:
-		return {"text": "", "segments": []}
+		return {"text": "", "segments": [], "usage": {"requests": 0}}
 
 	with tempfile.TemporaryDirectory() as cue_dir:
 		def _transcribe_window(index: int) -> tuple[int, str]:
@@ -621,100 +491,57 @@ def _transcribe_with_openai(
 		if text:
 			segments.append({"start": start, "end": end, "text": text})
 
-	return {"text": " ".join(seg["text"] for seg in segments), "segments": segments}
+	return {
+		"text": " ".join(seg["text"] for seg in segments),
+		"segments": segments,
+		"usage": {"requests": len(windows)},
+	}
 
 
 def transcribe_audio_file(
 	audio_path: str,
-	gemini_api_key: str | None = None,
-	# whisper-1 forced 120s chunks to stay under its 25MB upload cap. Gemini accepts
-	# hours of audio, so we chunk purely to bound timestamp drift and to keep the
-	# requests parallel — 5 minutes cuts the request count 2.5x versus the old default.
+	openai_api_key: str,
+	# whisper-1 caps uploads at 25MB, which our 32kbps mono mp3 only reaches around
+	# 100 minutes; chunking also bounds its timestamp drift and keeps the requests
+	# parallel. The text-only models ignore this and cut on silence instead.
 	chunk_seconds: int = 300,
-	max_workers: int = 4,
 	model: str | None = None,
-	openai_api_key: str | None = None,
 ) -> dict:
 	model = resolve_transcribe_model(model)
-
-	if transcribe_model_provider(model) == "openai":
-		if not openai_api_key:
-			raise ValueError(f"OPENAI_API_KEY is required for {model}")
-		return _transcribe_with_openai(
-			audio_path,
-			openai_api_key,
-			model,
-			chunk_seconds=chunk_seconds,
-		)
-
-	if not gemini_api_key:
-		raise ValueError(f"GEMINI_API_KEY is required for {model}")
-	client = genai.Client(api_key=gemini_api_key)
+	if not openai_api_key:
+		raise ValueError(f"OPENAI_API_KEY is required for {model}")
 
 	try:
-		duration = get_video_duration_seconds(audio_path)
+		audio_seconds = get_video_duration_seconds(audio_path)
 	except Exception:
-		duration = 0.0
+		audio_seconds = 0.0
 
-	# Short clips: one request avoids split/merge overhead.
-	if duration <= chunk_seconds * 1.5:
-		text, segments = _transcribe_chunk(client, audio_path, model)
-		return {"text": text, "segments": segments}
-
-	# Long clips: split and transcribe chunks concurrently to parallelize API latency.
-	with tempfile.TemporaryDirectory() as chunk_dir:
-		chunks = _split_audio_into_chunks(audio_path, chunk_seconds, chunk_dir)
-		if len(chunks) <= 1:
-			text, segments = _transcribe_chunk(client, audio_path, model)
-			return {"text": text, "segments": segments}
-
-		offsets: list[float] = []
-		running = 0.0
-		for chunk in chunks:
-			offsets.append(running)
-			try:
-				running += get_video_duration_seconds(str(chunk))
-			except Exception:
-				running += chunk_seconds
-
-		results: list[tuple[str, list[dict]] | None] = [None] * len(chunks)
-		with ThreadPoolExecutor(max_workers=max_workers) as executor:
-			futures = {
-				executor.submit(_transcribe_chunk, client, str(chunk), model): idx
-				for idx, chunk in enumerate(chunks)
-			}
-			for future in as_completed(futures):
-				results[futures[future]] = future.result()
-
-	texts: list[str] = []
-	merged_segments: list[dict] = []
-	for idx, result in enumerate(results):
-		if result is None:
-			continue
-		text, segments = result
-		offset = offsets[idx]
-		if text.strip():
-			texts.append(text.strip())
-		for seg in segments:
-			merged_segments.append(
-				{
-					"start": seg["start"] + offset,
-					"end": seg["end"] + offset,
-					"text": seg["text"],
-				}
-			)
-
-	return {"text": " ".join(texts), "segments": merged_segments}
+	result = _transcribe_with_openai(
+		audio_path,
+		openai_api_key,
+		model,
+		chunk_seconds=chunk_seconds,
+	)
+	result["audio_seconds"] = audio_seconds
+	return result
 
 
-def rewrite_caption_segments(segments: list[dict], openai_api_key: str) -> list[dict]:
+REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gpt-5")
+
+
+def rewrite_caption_segments(
+	segments: list[dict], openai_api_key: str
+) -> tuple[list[dict], dict]:
 	"""Fix typos/spelling in caption text using an LLM while keeping timing unchanged.
 
-	Still runs on OpenAI; only transcription moved to Gemini.
+	This is the paid, non-deterministic proofreader. For the free, repeatable pass
+	see `polish_captions`. Returns the rewritten segments plus a cost report, because
+	unlike the deterministic pass this one shows up on the bill.
 	"""
 	if not segments:
-		return []
+		return [], pricing.report_llm_run(REWRITE_MODEL, 0.0)
 
+	started = time.monotonic()
 	client = OpenAI(api_key=openai_api_key)
 	numbered = [{"i": idx, "text": seg["text"]} for idx, seg in enumerate(segments)]
 
@@ -731,7 +558,7 @@ def rewrite_caption_segments(segments: list[dict], openai_api_key: str) -> list[
 	)
 
 	response = client.chat.completions.create(
-		model="gpt-5",
+		model=REWRITE_MODEL,
 		messages=[
 			{"role": "system", "content": system_prompt},
 			{"role": "user", "content": user_prompt},
@@ -751,7 +578,15 @@ def rewrite_caption_segments(segments: list[dict], openai_api_key: str) -> list[
 				"text": corrections.get(idx, seg["text"]).strip() or seg["text"],
 			}
 		)
-	return rewritten
+
+	usage = getattr(response, "usage", None)
+	stats = pricing.report_llm_run(
+		REWRITE_MODEL,
+		elapsed_seconds=time.monotonic() - started,
+		input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+		output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+	)
+	return rewritten, stats
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -843,12 +678,37 @@ def load_video_paths(video_paths: list[str] | None, video_list_file: str | None)
 	return paths
 
 
+def polish_captions(
+	segments: list[dict],
+	glossary: Glossary | None = None,
+	split_lines: bool = True,
+) -> tuple[list[dict], dict]:
+	"""Deterministic clean-up pass: word system, spacing, line splitting, timing.
+
+	Separate from `rewrite_caption_segments`, which is the (paid, non-deterministic)
+	LLM proofreader. This one costs nothing and always produces the same output for
+	the same input, so it can run automatically after every transcription.
+	"""
+	return caption_polish.polish_segments(segments, glossary=glossary, split_lines=split_lines)
+
+
+def estimate_video_run(video_path: str, model: str | None = None) -> dict:
+	"""Projected duration and cost for transcribing a video, before running it."""
+	model = resolve_transcribe_model(model)
+	try:
+		audio_seconds = get_video_duration_seconds(video_path)
+	except Exception:
+		audio_seconds = 0.0
+	return pricing.estimate_run(model, transcribe_model_provider(model), audio_seconds)
+
+
 def process_video(
 	video_path: str,
-	gemini_api_key: str | None = None,
+	openai_api_key: str,
 	output_dir: str | None = None,
 	model: str | None = None,
-	openai_api_key: str | None = None,
+	polish: bool = True,
+	glossary: Glossary | None = None,
 ) -> dict:
 	video_file = Path(video_path)
 	if not video_file.exists():
@@ -857,32 +717,54 @@ def process_video(
 	output_base = Path(output_dir) if output_dir else video_file.parent
 	output_base.mkdir(parents=True, exist_ok=True)
 
+	model = resolve_transcribe_model(model)
+	started = time.monotonic()
+
 	with tempfile.TemporaryDirectory() as temp_dir:
 		audio_path = Path(temp_dir) / f"{video_file.stem}.mp3"
 		extract_audio_to_mp3(str(video_file), str(audio_path))
 		result = transcribe_audio_file(
 			str(audio_path),
-			gemini_api_key,
+			openai_api_key,
 			model=model,
-			openai_api_key=openai_api_key,
 		)
+
+	segments = result["segments"]
+	text = result["text"]
+	polish_report: dict | None = None
+	if polish:
+		segments, polish_report = polish_captions(segments, glossary=glossary)
+		# Keep the plain transcript consistent with the captions the user will see.
+		text = " ".join(segment["text"] for segment in segments)
+
+	# The report covers the whole call — audio extraction included — because that is
+	# the wait the user actually experiences.
+	stats = pricing.report_run(
+		model=model,
+		provider=transcribe_model_provider(model),
+		audio_seconds=result.get("audio_seconds", 0.0),
+		elapsed_seconds=time.monotonic() - started,
+		usage=result.get("usage"),
+	)
 
 	text_path = output_base / f"{video_file.stem}.txt"
 	srt_path = output_base / f"{video_file.stem}.srt"
-	text_path.write_text(result["text"], encoding="utf-8")
-	srt_path.write_text(segments_to_srt(result["segments"]), encoding="utf-8")
+	text_path.write_text(text, encoding="utf-8")
+	srt_path.write_text(segments_to_srt(segments), encoding="utf-8")
 
 	return {
-		"text": result["text"],
-		"segments": result["segments"],
-		"model": resolve_transcribe_model(model),
+		"text": text,
+		"segments": segments,
+		"model": model,
+		"stats": stats,
+		"polish_report": polish_report,
 		"text_path": text_path,
 		"srt_path": srt_path,
 	}
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(description="Extract audio from video files and transcribe them with Gemini or OpenAI")
+	parser = argparse.ArgumentParser(description="Extract audio from video files and transcribe them with OpenAI")
 	parser.add_argument("video_paths", nargs="*", help="Paths to input video files")
 	parser.add_argument("-l", "--video-list", dest="video_list_file", help="Text file containing one video path per line")
 	parser.add_argument("-o", "--output-dir", dest="output_dir", help="Directory where transcripts are saved")
@@ -892,30 +774,72 @@ def main() -> None:
 		dest="model",
 		help="Model to transcribe with (default: %s)" % DEFAULT_TRANSCRIBE_MODEL,
 	)
+	parser.add_argument(
+		"--no-polish",
+		dest="polish",
+		action="store_false",
+		help="Skip the glossary/line-splitting clean-up pass",
+	)
+	parser.add_argument(
+		"--estimate-only",
+		dest="estimate_only",
+		action="store_true",
+		help="Print the projected time and cost without transcribing",
+	)
 	args = parser.parse_args()
 
 	load_dotenv()
 	model = resolve_transcribe_model(args.model)
-	provider = transcribe_model_provider(model)
-	gemini_key = os.getenv("GEMINI_API_KEY")
 	openai_key = os.getenv("OPENAI_API_KEY")
-	if provider == "gemini" and not gemini_key:
-		raise ValueError("Set GEMINI_API_KEY in your .env file")
-	if provider == "openai" and not openai_key:
+	if not openai_key and not args.estimate_only:
 		raise ValueError("Set OPENAI_API_KEY in your .env file")
 
 	video_paths = load_video_paths(args.video_paths, args.video_list_file)
 
+	if args.estimate_only:
+		for video_path in video_paths:
+			estimate = estimate_video_run(video_path, model)
+			print(
+				f"{video_path}: ~{estimate['estimated_seconds']:.0f}s, "
+				f"~${estimate['estimated_cost_usd']:.4f} "
+				f"({estimate['audio_seconds']:.0f}s audio, {estimate['basis']})"
+			)
+		return
+
+	grand_total = 0.0
 	for video_path in video_paths:
 		result = process_video(
 			video_path,
-			gemini_key,
+			openai_key,
 			args.output_dir,
 			model=model,
-			openai_api_key=openai_key,
+			polish=args.polish,
 		)
 		print(f"Saved transcript: {result['text_path']}")
 		print(f"Saved captions: {result['srt_path']}")
+
+		stats = result["stats"]
+		grand_total += stats["estimated_cost_usd"]
+		print(
+			f"  {stats['model']}: {stats['elapsed_seconds']:.1f}s for "
+			f"{stats['audio_seconds']:.0f}s of audio "
+			f"({stats.get('realtime_factor', 0)}x realtime), "
+			f"~${stats['estimated_cost_usd']:.4f} [{stats['cost_basis']}]"
+		)
+		report = result.get("polish_report")
+		if report:
+			print(
+				f"  polish: {report['correction_count']} word fixes, "
+				f"{report['segments_in']} -> {report['segments_out']} lines, "
+				f"{len(report['timing_issues'])} timing fixes "
+				f"(tokenizer: {report['tokenizer']})"
+			)
+			for rule in report["by_rule"][:10]:
+				variants = ", ".join(f"{before} x{count}" for before, count in rule["variants"])
+				print(f"    {rule['after']} <- {variants}")
+
+	if len(video_paths) > 1:
+		print(f"Total estimated cost: ~${grand_total:.4f}")
 
 
 if __name__ == "__main__":

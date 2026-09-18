@@ -1,12 +1,14 @@
 import logging
 import os
+import re
 import shutil
 import time
 import io
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
@@ -17,6 +19,8 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 import pipeline
+import caption_polish
+import glossary as glossary_module
 import models
 import auth
 from database import engine, get_db
@@ -67,6 +71,15 @@ def init_database():
                         "ALTER TABLE videos ADD COLUMN IF NOT EXISTS project_id "
                         "INTEGER REFERENCES projects(id)"
                     )
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS transcribe_stats JSONB")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS polish_report JSONB")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS rewrite_stats JSONB")
                 )
                 position_exists = conn.execute(
                     text(
@@ -124,9 +137,7 @@ VIDEOS_DIR.mkdir(exist_ok=True)
 TEXTS_DIR.mkdir(exist_ok=True)
 FRAMES_DIR.mkdir(exist_ok=True)
 
-# Transcription runs on Gemini or OpenAI (per-request model choice); caption rewriting
-# runs on OpenAI only.
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+# Transcription and the optional LLM caption rewrite both run on OpenAI.
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 @app.get("/api/health")
@@ -204,6 +215,11 @@ class VideoResponse(BaseModel):
     has_transcript: bool
     transcript_text: Optional[str] = None
     caption_segments: Optional[List[CaptionSegment]] = None
+    # Free-form so a new field in pricing.py / caption_polish.py reaches the UI
+    # without a matching schema change here.
+    transcribe_stats: Optional[dict] = None
+    polish_report: Optional[dict] = None
+    rewrite_stats: Optional[dict] = None
     project_id: Optional[int] = None
     created_at: datetime
 
@@ -216,8 +232,48 @@ class VideoUpdateRequest(BaseModel):
 class CaptionSegmentUpdateRequest(BaseModel):
     text: str
 
+class CaptionReplaceRequest(BaseModel):
+    """A find & replace over a video's caption lines."""
+
+    find: str
+    replace: str
+    match_case: bool = False
+    # None means every line; a list limits the run to those cue indexes, which is how
+    # a single-line replace is expressed.
+    segment_indexes: Optional[List[int]] = None
+    # Also teach the pair to the word system, so the next transcript fixes it itself.
+    save_to_glossary: bool = False
+
+class CaptionReplacementItem(BaseModel):
+    id: int
+    find_text: str
+    replace_text: str
+    match_case: bool
+    occurrences: int
+    segments_changed: int
+    segment_indexes: List[int] = []
+    glossary_rule_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class CaptionReplaceResponse(BaseModel):
+    video: VideoResponse
+    occurrences: int
+    segments_changed: int
+    glossary_rule_id: Optional[str] = None
+    history: CaptionReplacementItem
+
 class TranscribeRequest(BaseModel):
     model: Optional[str] = None
+    # The clean-up pass is deterministic and free, so it runs by default.
+    polish: bool = True
+
+class PolishRequest(BaseModel):
+    split_lines: bool = True
+    min_chars: int = caption_polish.MIN_LINE_CHARS
+    max_chars: int = caption_polish.MAX_LINE_CHARS
 
 class TranscribeModel(BaseModel):
     id: str
@@ -225,6 +281,53 @@ class TranscribeModel(BaseModel):
     description: str
     provider: str
     is_default: bool
+    estimated_cost_per_minute_usd: float
+    estimated_seconds_per_minute: float
+
+class TranscribeEstimate(BaseModel):
+    model: str
+    provider: str
+    audio_seconds: float
+    estimated_seconds: float
+    estimated_cost_usd: float
+    basis: str
+    is_estimate_only: bool
+
+class GlossaryRuleRequest(BaseModel):
+    right: str
+    wrong: List[str] = []
+    category: str = "term"
+    note: Optional[str] = None
+    # A protected entry keeps a Thai transliteration as-is and shields it from every
+    # other rule; it needs no `wrong` list.
+    is_protected: bool = False
+
+class GlossaryRuleToggleRequest(BaseModel):
+    enabled: bool
+
+class GlossaryRuleResponse(BaseModel):
+    id: str
+    right: str
+    wrong: List[str]
+    category: str
+    category_label: str
+    note: str
+    source: str
+    enabled: bool
+
+class GlossaryResponse(BaseModel):
+    rules: List[GlossaryRuleResponse]
+    protected: List[str]
+    categories: dict
+    stats: dict
+
+class GlossaryPreviewRequest(BaseModel):
+    text: str
+
+class GlossaryPreviewResponse(BaseModel):
+    before: str
+    after: str
+    corrections: List[dict]
 
 class VideoMoveRequest(BaseModel):
     project_id: Optional[int] = None
@@ -474,13 +577,55 @@ def list_projects(db: Session = Depends(get_db), current_user: models.User = Dep
         for p in projects
     ]
 
+def _reserve_video_path(original_filename: str) -> tuple[Path, str]:
+    """Atomically claim a filename for a new upload under `VIDEOS_DIR`.
+
+    Opens with O_CREAT | O_EXCL so two uploads racing on the same name (a real
+    possibility now that uploads run concurrently) can never both win the same path —
+    the loser retries with the next numbered suffix instead of silently overwriting or
+    interleaving bytes into the winner's file. A plain `exists()` check-then-create, as
+    this used to be, has exactly that race.
+    """
+    # basename() strips any directory component a crafted filename might carry
+    # (e.g. "../../etc/passwd"), so the reserved path can never leave VIDEOS_DIR.
+    safe_filename = os.path.basename(original_filename).replace(" ", "_") or "video"
+    stem = Path(safe_filename).stem or "video"
+    suffix = Path(safe_filename).suffix
+    candidate = safe_filename
+    counter = 1
+    while True:
+        path = VIDEOS_DIR / candidate
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return path, candidate
+        except FileExistsError:
+            candidate = f"{stem}_{counter}{suffix}"
+            counter += 1
+
+# Batched to this many bytes before each write, so the event loop is handed back to
+# other requests (uploads included) after every small network read instead of once
+# per whole file, while still avoiding a threadpool dispatch per tiny TCP chunk.
+UPLOAD_WRITE_CHUNK_BYTES = 4 * 1024 * 1024
+
 @app.post("/api/videos", response_model=VideoResponse, status_code=201)
 async def upload_video(
-    file: UploadFile = File(...),
-    project_id: Optional[int] = Form(None),
+    request: Request,
+    filename: str = Query(..., min_length=1, description="Original filename from the client"),
+    project_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
+    """Stream the request body straight to disk.
+
+    Deliberately not a `File(...)`/multipart endpoint: FastAPI's multipart parser
+    spools the upload into a temp file first and our old code then copied *that* into
+    `videos/` — every upload hit disk twice, and the copy was a blocking synchronous
+    call inside an async endpoint, which froze the whole worker (every other request
+    on it, including other uploads) until it finished. Reading the raw body directly
+    means one disk write, and awaiting the stream yields control between chunks so
+    multiple uploads — and everything else — actually run concurrently.
+    """
     if project_id is not None:
         project = (
             db.query(models.Project)
@@ -490,24 +635,34 @@ async def upload_video(
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
-    safe_filename = file.filename.replace(" ", "_")
-    file_path = VIDEOS_DIR / safe_filename
+    file_path, safe_filename = _reserve_video_path(filename)
 
-    # Ensure unique filename
-    counter = 1
-    stem = file_path.stem
-    suffix = file_path.suffix
-    while file_path.exists():
-        safe_filename = f"{stem}_{counter}{suffix}"
-        file_path = VIDEOS_DIR / safe_filename
-        counter += 1
+    try:
+        pending: list[bytes] = []
+        pending_size = 0
+        with open(file_path, "wb") as buffer:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                pending.append(chunk)
+                pending_size += len(chunk)
+                if pending_size >= UPLOAD_WRITE_CHUNK_BYTES:
+                    await run_in_threadpool(buffer.write, b"".join(pending))
+                    pending.clear()
+                    pending_size = 0
+            if pending:
+                await run_in_threadpool(buffer.write, b"".join(pending))
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    if file_path.stat().st_size == 0:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     db_video = models.Video(
         filename=safe_filename,
-        original_name=file.filename,
+        original_name=os.path.basename(filename) or filename,
         owner_id=current_user.id,
         project_id=project_id,
         position=_next_position(db, current_user.id, project_id),
@@ -835,23 +990,403 @@ def update_caption_segment(
     db.refresh(video)
     return video
 
-def _configured_providers() -> set:
-    configured = set()
-    if gemini_api_key:
-        configured.add("gemini")
-    if openai_api_key:
-        configured.add("openai")
-    return configured
+def _compile_caption_find(find: str, match_case: bool) -> "re.Pattern[str]":
+    """Literal search pattern. Escaped on purpose: the box is find & replace, not regex."""
+    return re.compile(re.escape(find), 0 if match_case else re.IGNORECASE)
+
+@app.get(
+    "/api/videos/{video_id}/captions/replacements",
+    response_model=List[CaptionReplacementItem],
+)
+def list_caption_replacements(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Every find & replace run on this video, newest first."""
+    _get_owned_video(video_id, db, current_user)
+    rows = (
+        db.query(models.CaptionReplacement)
+        .filter(models.CaptionReplacement.video_id == video_id)
+        .order_by(models.CaptionReplacement.id.desc())
+        .all()
+    )
+    return rows
+
+@app.post("/api/videos/{video_id}/captions/replace", response_model=CaptionReplaceResponse)
+def replace_in_captions(
+    video_id: int,
+    payload: CaptionReplaceRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Replace a phrase across the caption lines and record what was changed.
+
+    Every run is logged in `caption_replacements` (the before and after text), and can
+    optionally be taught to the word system so the next transcript fixes it on its own.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+
+    find = payload.find
+    if not find.strip():
+        raise HTTPException(status_code=400, detail="Enter the text to find")
+    replace = payload.replace
+    if find == replace:
+        raise HTTPException(status_code=400, detail="The replacement is the same as the text found")
+
+    segments = video.caption_segments or []
+    if not segments:
+        raise HTTPException(status_code=404, detail="Captions not available")
+
+    if payload.segment_indexes is None:
+        targets = range(len(segments))
+    else:
+        out_of_range = [i for i in payload.segment_indexes if not 0 <= i < len(segments)]
+        if out_of_range:
+            raise HTTPException(status_code=404, detail="Caption segment not found")
+        targets = sorted(set(payload.segment_indexes))
+
+    pattern = _compile_caption_find(find, payload.match_case)
+    is_deletion = not replace.strip()
+
+    # JSON columns are only flushed when reassigned, so rebuild the list.
+    updated = [dict(seg) for seg in segments]
+    occurrences = 0
+    changed_indexes: List[int] = []
+
+    for index in targets:
+        original = updated[index].get("text") or ""
+        # A plain lambda, so a backslash group reference in the replacement stays literal.
+        new_text, count = pattern.subn(lambda _match: replace, original)
+        if not count:
+            continue
+        if is_deletion:
+            # Deleting a word leaves the spaces that surrounded it behind.
+            new_text = re.sub(r"[ \t]{2,}", " ", new_text)
+        new_text = new_text.strip()
+        if not new_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Line {index + 1} would be left empty by this replacement",
+            )
+        updated[index]["text"] = new_text
+        occurrences += count
+        changed_indexes.append(index)
+
+    if not occurrences:
+        raise HTTPException(status_code=404, detail=f"No caption line contains {find!r}")
+
+    rule_id: Optional[str] = None
+    if payload.save_to_glossary:
+        rule_id = _teach_glossary_pair(db, current_user, wrong=find, right=replace, video=video)
+
+    history = models.CaptionReplacement(
+        video_id=video.id,
+        owner_id=current_user.id,
+        find_text=find,
+        replace_text=replace,
+        match_case=payload.match_case,
+        occurrences=occurrences,
+        segments_changed=len(changed_indexes),
+        segment_indexes=changed_indexes,
+        glossary_rule_id=rule_id,
+    )
+    db.add(history)
+
+    video.caption_segments = updated
+    video.transcript_text = " ".join(seg["text"] for seg in updated)
+    db.commit()
+    db.refresh(video)
+    db.refresh(history)
+
+    return {
+        "video": video,
+        "occurrences": occurrences,
+        "segments_changed": len(changed_indexes),
+        "glossary_rule_id": rule_id,
+        "history": history,
+    }
+
+# ---------------------------------------------------------------------------
+# The word system (ASR correction glossary)
+# ---------------------------------------------------------------------------
+def _glossary_rows(db: Session, user: models.User) -> List[models.GlossaryRule]:
+    """A user's own glossary rows plus any shared ones with no owner.
+
+    Shared rows come first so that when both exist for the same rule id, the user's
+    own row is applied last and wins. Sorted in Python because NULLS FIRST ordering
+    is not portable across our SQLite and Postgres targets.
+    """
+    rows = (
+        db.query(models.GlossaryRule)
+        .filter(
+            (models.GlossaryRule.owner_id == user.id)
+            | (models.GlossaryRule.owner_id.is_(None))
+        )
+        .all()
+    )
+    return sorted(rows, key=lambda row: (row.rule_id, row.owner_id is not None))
+
+def _build_glossary(db: Session, user: models.User) -> glossary_module.Glossary:
+    """Compile the built-in word system with this user's additions layered on top."""
+    rows = _glossary_rows(db, user)
+    extra_rules = [
+        {
+            "id": row.rule_id,
+            "right": row.right,
+            "wrong": list(row.wrong or []),
+            "category": row.category,
+            "note": row.note or "",
+            "source": "user",
+        }
+        for row in rows
+        if not row.is_protected
+    ]
+    extra_protected = [row.right for row in rows if row.is_protected and not row.is_disabled]
+    disabled = {row.rule_id for row in rows if row.is_disabled}
+    return glossary_module.build_glossary(
+        extra_rules=extra_rules,
+        disabled_rule_ids=disabled,
+        extra_protected=extra_protected,
+    )
+
+# A rule is meant to be a term, not a sentence; longer finds are one-off edits.
+MAX_GLOSSARY_TERM_CHARS = 80
+
+def _teach_glossary_pair(
+    db: Session,
+    user: models.User,
+    *,
+    wrong: str,
+    right: str,
+    video: models.Video,
+) -> str:
+    """Record a `wrong -> right` pair from a caption edit and return its rule id.
+
+    Unlike `upsert_glossary_rule` this never clears an existing `wrong` list: a find &
+    replace teaches one more misheard spelling, it does not redefine the rule. If a rule
+    for that correct spelling already exists it is extended in place, whatever category
+    it sits in, so "Roboflow" does not end up as both a built-in platform rule and a
+    near-identical term rule. An existing rule is also copied into the user's own row
+    first, because a user row replaces a rule wholesale when the glossary is compiled.
+    """
+    wrong = wrong.strip()
+    right = right.strip()
+    if not wrong or not right:
+        raise HTTPException(
+            status_code=400,
+            detail="A word-system entry needs both the wrong and the correct spelling",
+        )
+    if len(wrong) > MAX_GLOSSARY_TERM_CHARS or len(right) > MAX_GLOSSARY_TERM_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This phrase is too long for the word system "
+                f"(limit {MAX_GLOSSARY_TERM_CHARS} characters) — replace it without saving"
+            ),
+        )
+
+    existing = next(
+        (
+            rule
+            for rule in _build_glossary(db, user).rules
+            if rule.right.lower() == right.lower()
+        ),
+        None,
+    )
+    rule_id = (
+        existing.id
+        if existing
+        else glossary_module.Rule(right=right, wrong=[wrong], category="term").id
+    )
+
+    row = (
+        db.query(models.GlossaryRule)
+        .filter(
+            models.GlossaryRule.rule_id == rule_id,
+            models.GlossaryRule.owner_id == user.id,
+        )
+        .first()
+    )
+    if row is None:
+        row = models.GlossaryRule(
+            owner_id=user.id,
+            rule_id=rule_id,
+            right=existing.right if existing else right,
+            wrong=list(existing.wrong) if existing else [],
+            category=existing.category if existing else "term",
+            note=existing.note if existing else "",
+        )
+        db.add(row)
+
+    variants = list(row.wrong or [])
+    # The canonical spelling is already matched in any casing, so a pair that only
+    # changes case ("roboflow" -> "Roboflow") adds no variant, just the rule.
+    already_known = wrong.lower() == (row.right or "").lower() or any(
+        variant.lower() == wrong.lower() for variant in variants
+    )
+    if not already_known:
+        variants.append(wrong)
+    row.wrong = variants
+    row.is_protected = False
+    row.is_disabled = False
+    if not (row.note or "").strip():
+        row.note = f"จากการแก้คำในคำบรรยายของ {video.original_name}"
+    return rule_id
+
+@app.get("/api/glossary", response_model=GlossaryResponse)
+def get_glossary(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
+    compiled = _build_glossary(db, current_user)
+    return {
+        "rules": compiled.rule_dicts(),
+        "protected": compiled.protected,
+        "categories": glossary_module.CATEGORY_LABELS,
+        "stats": compiled.stats(),
+    }
+
+@app.post("/api/glossary", response_model=GlossaryRuleResponse, status_code=201)
+def upsert_glossary_rule(
+    payload: GlossaryRuleRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    right = payload.right.strip()
+    if not right:
+        raise HTTPException(status_code=400, detail="'right' (the correct spelling) is required")
+
+    wrong = [item.strip() for item in payload.wrong if item.strip()]
+    if not wrong and not payload.is_protected:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one misheard spelling, or mark the entry as protected",
+        )
+
+    category = "protected" if payload.is_protected else (payload.category or "term").strip()
+    if category not in glossary_module.CATEGORY_LABELS:
+        raise HTTPException(status_code=400, detail=f"Unknown category: {category}")
+
+    # Same id format as the built-ins, so re-adding a built-in's spelling overrides it
+    # rather than creating a near-duplicate rule.
+    rule_id = glossary_module.Rule(right=right, wrong=wrong, category=category).id
+
+    # Scoped to this user on purpose: saving over a shared (owner-less) rule would
+    # change it for everyone, so we create a personal override instead.
+    row = (
+        db.query(models.GlossaryRule)
+        .filter(
+            models.GlossaryRule.rule_id == rule_id,
+            models.GlossaryRule.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if row is None:
+        row = models.GlossaryRule(owner_id=current_user.id, rule_id=rule_id)
+        db.add(row)
+
+    row.right = right
+    row.wrong = wrong
+    row.category = category
+    row.note = payload.note or ""
+    row.is_protected = payload.is_protected
+    row.is_disabled = False
+    db.commit()
+    db.refresh(row)
+
+    return {
+        "id": row.rule_id,
+        "right": row.right,
+        "wrong": list(row.wrong or []),
+        "category": row.category,
+        "category_label": glossary_module.CATEGORY_LABELS.get(row.category, row.category),
+        "note": row.note or "",
+        "source": "user",
+        "enabled": not row.is_disabled,
+    }
+
+@app.patch("/api/glossary/{rule_id}", status_code=204)
+def toggle_glossary_rule(
+    rule_id: str,
+    payload: GlossaryRuleToggleRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Enable or disable a rule. Works for built-ins too, by storing a marker row."""
+    row = (
+        db.query(models.GlossaryRule)
+        .filter(
+            models.GlossaryRule.rule_id == rule_id,
+            models.GlossaryRule.owner_id == current_user.id,
+        )
+        .first()
+    )
+
+    if row is None:
+        builtin = next(
+            (
+                rule
+                for rule in glossary_module.build_glossary().rules
+                if rule.id == rule_id
+            ),
+            None,
+        )
+        if builtin is None:
+            raise HTTPException(status_code=404, detail="Glossary rule not found")
+        # Disabling a built-in is recorded as a user row carrying the same id.
+        row = models.GlossaryRule(
+            owner_id=current_user.id,
+            rule_id=builtin.id,
+            right=builtin.right,
+            wrong=list(builtin.wrong),
+            category=builtin.category,
+            note=builtin.note,
+        )
+        db.add(row)
+
+    row.is_disabled = not payload.enabled
+    db.commit()
+    return Response(status_code=204)
+
+@app.delete("/api/glossary/{rule_id}", status_code=204)
+def delete_glossary_rule(
+    rule_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    row = (
+        db.query(models.GlossaryRule)
+        .filter(
+            models.GlossaryRule.rule_id == rule_id,
+            models.GlossaryRule.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Glossary rule not found")
+    db.delete(row)
+    db.commit()
+    return Response(status_code=204)
+
+@app.post("/api/glossary/preview", response_model=GlossaryPreviewResponse)
+def preview_glossary(
+    payload: GlossaryPreviewRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Run the word system over a sample line — for checking a rule before relying on it."""
+    compiled = _build_glossary(db, current_user)
+    corrected, corrections = compiled.correct(payload.text)
+    return {
+        "before": payload.text,
+        "after": caption_polish.normalize_spacing(corrected),
+        "corrections": corrections,
+    }
 
 @app.get("/api/transcribe-models", response_model=List[TranscribeModel])
 def list_transcribe_models(current_user: models.User = Depends(auth.get_current_user)):
-    # Hide models we have no key for — picking one would only fail at transcribe time.
-    configured = _configured_providers()
-    return [
-        entry
-        for entry in pipeline.available_transcribe_models()
-        if entry["provider"] in configured
-    ]
+    # Without a key, picking any model would only fail at transcribe time.
+    if not openai_api_key:
+        return []
+    return pipeline.available_transcribe_models()
 
 @app.post("/api/videos/{video_id}/transcribe", response_model=VideoResponse)
 def transcribe_video(
@@ -865,10 +1400,10 @@ def transcribe_video(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    provider = pipeline.transcribe_model_provider(model)
-    if provider not in _configured_providers():
-        key_name = "OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"
-        raise HTTPException(status_code=500, detail=f"{key_name} is not set (required by {model})")
+    if not openai_api_key:
+        raise HTTPException(
+            status_code=500, detail=f"OPENAI_API_KEY is not set (required by {model})"
+        )
 
     video = _get_owned_video(video_id, db, current_user)
 
@@ -879,22 +1414,90 @@ def transcribe_video(
     try:
         result = pipeline.process_video(
             str(file_path),
-            gemini_api_key,
+            openai_api_key,
             str(TEXTS_DIR),
             model=model,
-            openai_api_key=openai_api_key,
+            polish=payload.polish if payload else True,
+            glossary=_build_glossary(db, current_user),
         )
 
         video.has_transcript = True
         video.transcript_text = result["text"]
         video.caption_segments = result["segments"]
+        video.transcribe_stats = result["stats"]
+        video.polish_report = result["polish_report"]
         db.commit()
         db.refresh(video)
 
+        stats = result["stats"]
+        logger.info(
+            "Transcribed video %s with %s in %.1fs (%.0fs audio), est. $%.4f [%s]",
+            video_id, model, stats["elapsed_seconds"], stats["audio_seconds"],
+            stats["estimated_cost_usd"], stats["cost_basis"],
+        )
         return video
     except Exception:
         logger.exception("Transcription failed for video %s (model=%s)", video_id, model)
         raise HTTPException(status_code=500, detail=f"Transcription failed using {model}")
+
+@app.get("/api/videos/{video_id}/transcribe-estimate", response_model=TranscribeEstimate)
+def estimate_transcription(
+    video_id: int,
+    model: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Projected run time and cost, so the price is visible before the click."""
+    try:
+        resolved = pipeline.resolve_transcribe_model(model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    video = _get_owned_video(video_id, db, current_user)
+    file_path = VIDEOS_DIR / video.filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+
+    return pipeline.estimate_video_run(str(file_path), resolved)
+
+@app.post("/api/videos/{video_id}/polish-captions", response_model=VideoResponse)
+def polish_captions(
+    video_id: int,
+    payload: Optional[PolishRequest] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Re-run the deterministic clean-up: word system, spacing, line split, timings.
+
+    Costs nothing and needs no API key — unlike /rewrite-captions, which pays an LLM.
+    Safe to re-run: the word system is idempotent, and a line already inside the
+    character budget is left alone.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    if not video.caption_segments:
+        raise HTTPException(status_code=400, detail="No captions to polish. Transcribe first.")
+
+    options = payload or PolishRequest()
+    if options.min_chars < 1 or options.max_chars < options.min_chars:
+        raise HTTPException(status_code=400, detail="Require 1 <= min_chars <= max_chars")
+
+    try:
+        segments, report = caption_polish.polish_segments(
+            video.caption_segments,
+            glossary=_build_glossary(db, current_user),
+            min_chars=options.min_chars,
+            max_chars=options.max_chars,
+            split_lines=options.split_lines,
+        )
+        video.caption_segments = segments
+        video.transcript_text = " ".join(segment["text"] for segment in segments)
+        video.polish_report = report
+        db.commit()
+        db.refresh(video)
+        return video
+    except Exception:
+        logger.exception("Caption polish failed for video %s", video_id)
+        raise HTTPException(status_code=500, detail="Caption polish failed")
 
 @app.post("/api/videos/{video_id}/rewrite-captions", response_model=VideoResponse)
 def rewrite_captions(video_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
@@ -906,11 +1509,25 @@ def rewrite_captions(video_id: int, db: Session = Depends(get_db), current_user:
         raise HTTPException(status_code=400, detail="No captions to rewrite. Transcribe first.")
 
     try:
-        rewritten = pipeline.rewrite_caption_segments(video.caption_segments, openai_api_key)
-        video.caption_segments = rewritten
-        video.transcript_text = " ".join(seg["text"] for seg in rewritten)
+        rewritten, rewrite_stats = pipeline.rewrite_caption_segments(
+            video.caption_segments, openai_api_key
+        )
+        # The LLM rewrites text freely, which can re-introduce glued Thai/English and
+        # push a line past the budget, so the deterministic pass runs after it.
+        segments, report = caption_polish.polish_segments(
+            rewritten, glossary=_build_glossary(db, current_user)
+        )
+        video.caption_segments = segments
+        video.transcript_text = " ".join(seg["text"] for seg in segments)
+        video.polish_report = report
+        video.rewrite_stats = rewrite_stats
         db.commit()
         db.refresh(video)
+        logger.info(
+            "Rewrote captions for video %s with %s in %.1fs, est. $%.4f",
+            video_id, rewrite_stats["model"], rewrite_stats["elapsed_seconds"],
+            rewrite_stats["estimated_cost_usd"],
+        )
         return video
     except Exception:
         logger.exception("Caption rewrite failed for video %s", video_id)

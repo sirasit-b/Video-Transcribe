@@ -52,6 +52,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <span className="text-lg font-semibold tracking-tight">Video Transcribe</span>
         </Link>
         <div className="flex items-center gap-3 text-sm">
+          {/* ลิงก์ "ระบบคำ" ถูกซ่อนออกจากเมนูนี้ตามคำขอ — หน้า /glossary ยังใช้งานได้
+              ตามปกติผ่านลิงก์อื่นในแอป (เช่นในรายงานการขัดคำ) หรือเข้า URL ตรง ๆ */}
           {user.role === "admin" && (
             <>
               <Link
