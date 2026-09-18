@@ -77,3 +77,28 @@ class GlossaryRule(Base):
     is_disabled = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+class CaptionReplacement(Base):
+    """One find & replace run over a video's captions, kept as an audit trail.
+
+    Rows are never rewritten: re-running the same pair appends a second row, so the
+    history reads as what was actually done and when.
+    """
+
+    __tablename__ = "caption_replacements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id"), nullable=False, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    # The searched text and its replacement: the "before" and "after" of the edit.
+    find_text = Column(Text, nullable=False)
+    replace_text = Column(Text, nullable=False)
+    match_case = Column(Boolean, nullable=False, default=False)
+    # How much the run touched, so a history line stands on its own.
+    occurrences = Column(Integer, nullable=False, default=0)
+    segments_changed = Column(Integer, nullable=False, default=0)
+    # Which cues were rewritten, for a targeted (single-line) replace.
+    segment_indexes = Column(JSON, nullable=False, default=list)
+    # Set when the pair was also taught to the word system; holds the rule id.
+    glossary_rule_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

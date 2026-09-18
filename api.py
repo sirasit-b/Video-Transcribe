@@ -1,12 +1,14 @@
 import logging
 import os
+import re
 import shutil
 import time
 import io
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
@@ -229,6 +231,39 @@ class VideoUpdateRequest(BaseModel):
 
 class CaptionSegmentUpdateRequest(BaseModel):
     text: str
+
+class CaptionReplaceRequest(BaseModel):
+    """A find & replace over a video's caption lines."""
+
+    find: str
+    replace: str
+    match_case: bool = False
+    # None means every line; a list limits the run to those cue indexes, which is how
+    # a single-line replace is expressed.
+    segment_indexes: Optional[List[int]] = None
+    # Also teach the pair to the word system, so the next transcript fixes it itself.
+    save_to_glossary: bool = False
+
+class CaptionReplacementItem(BaseModel):
+    id: int
+    find_text: str
+    replace_text: str
+    match_case: bool
+    occurrences: int
+    segments_changed: int
+    segment_indexes: List[int] = []
+    glossary_rule_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class CaptionReplaceResponse(BaseModel):
+    video: VideoResponse
+    occurrences: int
+    segments_changed: int
+    glossary_rule_id: Optional[str] = None
+    history: CaptionReplacementItem
 
 class TranscribeRequest(BaseModel):
     model: Optional[str] = None
@@ -542,13 +577,55 @@ def list_projects(db: Session = Depends(get_db), current_user: models.User = Dep
         for p in projects
     ]
 
+def _reserve_video_path(original_filename: str) -> tuple[Path, str]:
+    """Atomically claim a filename for a new upload under `VIDEOS_DIR`.
+
+    Opens with O_CREAT | O_EXCL so two uploads racing on the same name (a real
+    possibility now that uploads run concurrently) can never both win the same path —
+    the loser retries with the next numbered suffix instead of silently overwriting or
+    interleaving bytes into the winner's file. A plain `exists()` check-then-create, as
+    this used to be, has exactly that race.
+    """
+    # basename() strips any directory component a crafted filename might carry
+    # (e.g. "../../etc/passwd"), so the reserved path can never leave VIDEOS_DIR.
+    safe_filename = os.path.basename(original_filename).replace(" ", "_") or "video"
+    stem = Path(safe_filename).stem or "video"
+    suffix = Path(safe_filename).suffix
+    candidate = safe_filename
+    counter = 1
+    while True:
+        path = VIDEOS_DIR / candidate
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return path, candidate
+        except FileExistsError:
+            candidate = f"{stem}_{counter}{suffix}"
+            counter += 1
+
+# Batched to this many bytes before each write, so the event loop is handed back to
+# other requests (uploads included) after every small network read instead of once
+# per whole file, while still avoiding a threadpool dispatch per tiny TCP chunk.
+UPLOAD_WRITE_CHUNK_BYTES = 4 * 1024 * 1024
+
 @app.post("/api/videos", response_model=VideoResponse, status_code=201)
 async def upload_video(
-    file: UploadFile = File(...),
-    project_id: Optional[int] = Form(None),
+    request: Request,
+    filename: str = Query(..., min_length=1, description="Original filename from the client"),
+    project_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
+    """Stream the request body straight to disk.
+
+    Deliberately not a `File(...)`/multipart endpoint: FastAPI's multipart parser
+    spools the upload into a temp file first and our old code then copied *that* into
+    `videos/` — every upload hit disk twice, and the copy was a blocking synchronous
+    call inside an async endpoint, which froze the whole worker (every other request
+    on it, including other uploads) until it finished. Reading the raw body directly
+    means one disk write, and awaiting the stream yields control between chunks so
+    multiple uploads — and everything else — actually run concurrently.
+    """
     if project_id is not None:
         project = (
             db.query(models.Project)
@@ -558,24 +635,34 @@ async def upload_video(
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
-    safe_filename = file.filename.replace(" ", "_")
-    file_path = VIDEOS_DIR / safe_filename
+    file_path, safe_filename = _reserve_video_path(filename)
 
-    # Ensure unique filename
-    counter = 1
-    stem = file_path.stem
-    suffix = file_path.suffix
-    while file_path.exists():
-        safe_filename = f"{stem}_{counter}{suffix}"
-        file_path = VIDEOS_DIR / safe_filename
-        counter += 1
+    try:
+        pending: list[bytes] = []
+        pending_size = 0
+        with open(file_path, "wb") as buffer:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                pending.append(chunk)
+                pending_size += len(chunk)
+                if pending_size >= UPLOAD_WRITE_CHUNK_BYTES:
+                    await run_in_threadpool(buffer.write, b"".join(pending))
+                    pending.clear()
+                    pending_size = 0
+            if pending:
+                await run_in_threadpool(buffer.write, b"".join(pending))
+    except Exception:
+        file_path.unlink(missing_ok=True)
+        raise
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    if file_path.stat().st_size == 0:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     db_video = models.Video(
         filename=safe_filename,
-        original_name=file.filename,
+        original_name=os.path.basename(filename) or filename,
         owner_id=current_user.id,
         project_id=project_id,
         position=_next_position(db, current_user.id, project_id),
@@ -903,6 +990,123 @@ def update_caption_segment(
     db.refresh(video)
     return video
 
+def _compile_caption_find(find: str, match_case: bool) -> "re.Pattern[str]":
+    """Literal search pattern. Escaped on purpose: the box is find & replace, not regex."""
+    return re.compile(re.escape(find), 0 if match_case else re.IGNORECASE)
+
+@app.get(
+    "/api/videos/{video_id}/captions/replacements",
+    response_model=List[CaptionReplacementItem],
+)
+def list_caption_replacements(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Every find & replace run on this video, newest first."""
+    _get_owned_video(video_id, db, current_user)
+    rows = (
+        db.query(models.CaptionReplacement)
+        .filter(models.CaptionReplacement.video_id == video_id)
+        .order_by(models.CaptionReplacement.id.desc())
+        .all()
+    )
+    return rows
+
+@app.post("/api/videos/{video_id}/captions/replace", response_model=CaptionReplaceResponse)
+def replace_in_captions(
+    video_id: int,
+    payload: CaptionReplaceRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Replace a phrase across the caption lines and record what was changed.
+
+    Every run is logged in `caption_replacements` (the before and after text), and can
+    optionally be taught to the word system so the next transcript fixes it on its own.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+
+    find = payload.find
+    if not find.strip():
+        raise HTTPException(status_code=400, detail="Enter the text to find")
+    replace = payload.replace
+    if find == replace:
+        raise HTTPException(status_code=400, detail="The replacement is the same as the text found")
+
+    segments = video.caption_segments or []
+    if not segments:
+        raise HTTPException(status_code=404, detail="Captions not available")
+
+    if payload.segment_indexes is None:
+        targets = range(len(segments))
+    else:
+        out_of_range = [i for i in payload.segment_indexes if not 0 <= i < len(segments)]
+        if out_of_range:
+            raise HTTPException(status_code=404, detail="Caption segment not found")
+        targets = sorted(set(payload.segment_indexes))
+
+    pattern = _compile_caption_find(find, payload.match_case)
+    is_deletion = not replace.strip()
+
+    # JSON columns are only flushed when reassigned, so rebuild the list.
+    updated = [dict(seg) for seg in segments]
+    occurrences = 0
+    changed_indexes: List[int] = []
+
+    for index in targets:
+        original = updated[index].get("text") or ""
+        # A plain lambda, so a backslash group reference in the replacement stays literal.
+        new_text, count = pattern.subn(lambda _match: replace, original)
+        if not count:
+            continue
+        if is_deletion:
+            # Deleting a word leaves the spaces that surrounded it behind.
+            new_text = re.sub(r"[ \t]{2,}", " ", new_text)
+        new_text = new_text.strip()
+        if not new_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Line {index + 1} would be left empty by this replacement",
+            )
+        updated[index]["text"] = new_text
+        occurrences += count
+        changed_indexes.append(index)
+
+    if not occurrences:
+        raise HTTPException(status_code=404, detail=f"No caption line contains {find!r}")
+
+    rule_id: Optional[str] = None
+    if payload.save_to_glossary:
+        rule_id = _teach_glossary_pair(db, current_user, wrong=find, right=replace, video=video)
+
+    history = models.CaptionReplacement(
+        video_id=video.id,
+        owner_id=current_user.id,
+        find_text=find,
+        replace_text=replace,
+        match_case=payload.match_case,
+        occurrences=occurrences,
+        segments_changed=len(changed_indexes),
+        segment_indexes=changed_indexes,
+        glossary_rule_id=rule_id,
+    )
+    db.add(history)
+
+    video.caption_segments = updated
+    video.transcript_text = " ".join(seg["text"] for seg in updated)
+    db.commit()
+    db.refresh(video)
+    db.refresh(history)
+
+    return {
+        "video": video,
+        "occurrences": occurrences,
+        "segments_changed": len(changed_indexes),
+        "glossary_rule_id": rule_id,
+        "history": history,
+    }
+
 # ---------------------------------------------------------------------------
 # The word system (ASR correction glossary)
 # ---------------------------------------------------------------------------
@@ -945,6 +1149,90 @@ def _build_glossary(db: Session, user: models.User) -> glossary_module.Glossary:
         disabled_rule_ids=disabled,
         extra_protected=extra_protected,
     )
+
+# A rule is meant to be a term, not a sentence; longer finds are one-off edits.
+MAX_GLOSSARY_TERM_CHARS = 80
+
+def _teach_glossary_pair(
+    db: Session,
+    user: models.User,
+    *,
+    wrong: str,
+    right: str,
+    video: models.Video,
+) -> str:
+    """Record a `wrong -> right` pair from a caption edit and return its rule id.
+
+    Unlike `upsert_glossary_rule` this never clears an existing `wrong` list: a find &
+    replace teaches one more misheard spelling, it does not redefine the rule. If a rule
+    for that correct spelling already exists it is extended in place, whatever category
+    it sits in, so "Roboflow" does not end up as both a built-in platform rule and a
+    near-identical term rule. An existing rule is also copied into the user's own row
+    first, because a user row replaces a rule wholesale when the glossary is compiled.
+    """
+    wrong = wrong.strip()
+    right = right.strip()
+    if not wrong or not right:
+        raise HTTPException(
+            status_code=400,
+            detail="A word-system entry needs both the wrong and the correct spelling",
+        )
+    if len(wrong) > MAX_GLOSSARY_TERM_CHARS or len(right) > MAX_GLOSSARY_TERM_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This phrase is too long for the word system "
+                f"(limit {MAX_GLOSSARY_TERM_CHARS} characters) — replace it without saving"
+            ),
+        )
+
+    existing = next(
+        (
+            rule
+            for rule in _build_glossary(db, user).rules
+            if rule.right.lower() == right.lower()
+        ),
+        None,
+    )
+    rule_id = (
+        existing.id
+        if existing
+        else glossary_module.Rule(right=right, wrong=[wrong], category="term").id
+    )
+
+    row = (
+        db.query(models.GlossaryRule)
+        .filter(
+            models.GlossaryRule.rule_id == rule_id,
+            models.GlossaryRule.owner_id == user.id,
+        )
+        .first()
+    )
+    if row is None:
+        row = models.GlossaryRule(
+            owner_id=user.id,
+            rule_id=rule_id,
+            right=existing.right if existing else right,
+            wrong=list(existing.wrong) if existing else [],
+            category=existing.category if existing else "term",
+            note=existing.note if existing else "",
+        )
+        db.add(row)
+
+    variants = list(row.wrong or [])
+    # The canonical spelling is already matched in any casing, so a pair that only
+    # changes case ("roboflow" -> "Roboflow") adds no variant, just the rule.
+    already_known = wrong.lower() == (row.right or "").lower() or any(
+        variant.lower() == wrong.lower() for variant in variants
+    )
+    if not already_known:
+        variants.append(wrong)
+    row.wrong = variants
+    row.is_protected = False
+    row.is_disabled = False
+    if not (row.note or "").strip():
+        row.note = f"จากการแก้คำในคำบรรยายของ {video.original_name}"
+    return rule_id
 
 @app.get("/api/glossary", response_model=GlossaryResponse)
 def get_glossary(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):

@@ -20,12 +20,16 @@ import {
   Wand2,
   Clock,
   DollarSign,
-  BookMarked,
   CheckSquare,
   Square,
   Archive,
   Trash2,
   Upload,
+  Search,
+  Replace,
+  CaseSensitive,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
@@ -77,6 +81,26 @@ interface PolishReport {
   line_split_count: number;
   tokenizer: string;
   line_budget?: { min: number; max: number };
+}
+
+interface CaptionReplacement {
+  id: number;
+  find_text: string;
+  replace_text: string;
+  match_case: boolean;
+  occurrences: number;
+  segments_changed: number;
+  segment_indexes: number[];
+  glossary_rule_id: string | null;
+  created_at: string;
+}
+
+interface CaptionReplaceResult {
+  video: VideoData;
+  occurrences: number;
+  segments_changed: number;
+  glossary_rule_id: string | null;
+  history: CaptionReplacement;
 }
 
 interface TranscribeEstimate {
@@ -174,6 +198,40 @@ function highlightSegments(text: string, corrections: Correction[]): { text: str
   return parts;
 }
 
+/** Split a caption line on every occurrence of the searched text. */
+function splitOnMatches(text: string, find: string, matchCase: boolean): { text: string; isMatch: boolean }[] {
+  if (!find) return [{ text, isMatch: false }];
+
+  const haystack = matchCase ? text : text.toLowerCase();
+  const needle = matchCase ? find : find.toLowerCase();
+
+  const parts: { text: string; isMatch: boolean }[] = [];
+  let cursor = 0;
+  let found = haystack.indexOf(needle);
+  while (found !== -1) {
+    if (found > cursor) parts.push({ text: text.slice(cursor, found), isMatch: false });
+    // Slice from the original text, so the match keeps its real casing.
+    parts.push({ text: text.slice(found, found + find.length), isMatch: true });
+    cursor = found + find.length;
+    found = haystack.indexOf(needle, cursor);
+  }
+  if (cursor < text.length) parts.push({ text: text.slice(cursor), isMatch: false });
+  return parts;
+}
+
+function countMatches(text: string, find: string, matchCase: boolean): number {
+  if (!find) return 0;
+  const haystack = matchCase ? text : text.toLowerCase();
+  const needle = matchCase ? find : find.toLowerCase();
+  let count = 0;
+  let cursor = haystack.indexOf(needle);
+  while (cursor !== -1) {
+    count += 1;
+    cursor = haystack.indexOf(needle, cursor + needle.length);
+  }
+  return count;
+}
+
 interface FrameItem {
   filename: string;
   url: string;
@@ -237,11 +295,36 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const videoRef = useRef<HTMLVideoElement>(null);
   const srtInputRef = useRef<HTMLInputElement>(null);
   const cueRefs = useRef<(HTMLDivElement | null)[]>([]);
+  // Whether the video was actually playing when a cue edit started, so finishing the
+  // edit only resumes playback if it had interrupted it.
+  const wasPlayingRef = useRef(false);
   const [activeCueIndex, setActiveCueIndex] = useState<number | null>(null);
   const [editingCueIndex, setEditingCueIndex] = useState<number | null>(null);
   const [cueDraft, setCueDraft] = useState("");
   const [savingCueIndex, setSavingCueIndex] = useState<number | null>(null);
   const [captionsVersion, setCaptionsVersion] = useState(0);
+
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const [showFindReplace, setShowFindReplace] = useState(false);
+  const [findText, setFindText] = useState("");
+  const [replaceText, setReplaceText] = useState("");
+  const [matchCase, setMatchCase] = useState(false);
+  const [saveToGlossary, setSaveToGlossary] = useState(true);
+  const [replacingScope, setReplacingScope] = useState<"all" | number | null>(null);
+  const [replaceNotice, setReplaceNotice] = useState<string | null>(null);
+  // Which hit of the search is currently scrolled to, as an offset into matchedIndexes.
+  const [matchCursor, setMatchCursor] = useState(0);
+
+  const captionSegments = video?.caption_segments ?? [];
+  const matchedIndexes = findText
+    ? captionSegments.reduce<number[]>((acc, seg, i) => {
+        if (countMatches(seg.text, findText, matchCase) > 0) acc.push(i);
+        return acc;
+      }, [])
+    : [];
+  const totalMatches = findText
+    ? captionSegments.reduce((sum, seg) => sum + countMatches(seg.text, findText, matchCase), 0)
+    : 0;
 
   const handleTranscribe = async () => {
     setIsTranscribing(true);
@@ -447,6 +530,9 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   };
 
   const startEditingCue = (index: number, text: string) => {
+    const el = videoRef.current;
+    wasPlayingRef.current = !!el && !el.paused;
+    el?.pause();
     setEditingCueIndex(index);
     setCueDraft(text);
   };
@@ -454,6 +540,55 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const cancelEditingCue = () => {
     setEditingCueIndex(null);
     setCueDraft("");
+    if (wasPlayingRef.current) {
+      wasPlayingRef.current = false;
+      videoRef.current?.play();
+    }
+  };
+
+  const closeFindReplace = () => {
+    setShowFindReplace(false);
+    setFindText("");
+    setReplaceText("");
+    setReplaceNotice(null);
+    setMatchCursor(0);
+  };
+
+  const jumpToMatch = (offset: number) => {
+    if (!matchedIndexes.length) return;
+    const next = (matchCursor + offset + matchedIndexes.length) % matchedIndexes.length;
+    setMatchCursor(next);
+    cueRefs.current[matchedIndexes[next]]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  /** Replace across every line ("all") or in one cue only (its index). */
+  const handleReplace = async (scope: "all" | number) => {
+    if (!findText) return;
+    setReplacingScope(scope);
+    setError(null);
+    setReplaceNotice(null);
+    try {
+      const res = await api.post<CaptionReplaceResult>(`/videos/${videoId}/captions/replace`, {
+        find: findText,
+        replace: replaceText,
+        match_case: matchCase,
+        segment_indexes: scope === "all" ? null : [scope],
+        save_to_glossary: saveToGlossary,
+      });
+      setVideo(res.data.video);
+      setCaptionsVersion((v) => v + 1);
+      setMatchCursor(0);
+      setReplaceNotice(
+        `แทนที่ ${res.data.occurrences} จุด ใน ${res.data.segments_changed} บรรทัด` +
+          (res.data.glossary_rule_id ? " · บันทึกเข้าระบบคำแล้ว" : "")
+      );
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "Failed to replace caption text");
+    } finally {
+      setReplacingScope(null);
+    }
   };
 
   const handleSaveCue = async (index: number) => {
@@ -566,11 +701,33 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     return () => el.removeEventListener("timeupdate", handleTimeUpdate);
   }, [video?.caption_segments]);
 
+  // Ctrl/Cmd+F opens our caption search instead of the browser's, which cannot see
+  // past the cue list's scroll container anyway. Esc closes it.
   useEffect(() => {
-    if (activeCueIndex !== null && editingCueIndex === null) {
+    if (!video?.caption_segments?.length) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setShowFindReplace(true);
+        // The input may only mount on this render, so focus on the next frame.
+        requestAnimationFrame(() => findInputRef.current?.select());
+      }
+      if (event.key === "Escape" && showFindReplace && editingCueIndex === null) {
+        closeFindReplace();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [video?.caption_segments?.length, showFindReplace, editingCueIndex]);
+
+  useEffect(() => {
+    // Following playback would fight the search for control of the scroll position.
+    if (activeCueIndex !== null && editingCueIndex === null && !showFindReplace) {
       cueRefs.current[activeCueIndex]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
-  }, [activeCueIndex, editingCueIndex]);
+  }, [activeCueIndex, editingCueIndex, showFindReplace]);
 
   useEffect(() => {
     if (activeFrameIndex === null) {
@@ -868,44 +1025,62 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
         {/* Captions panel beside the video */}
         {(video.has_transcript || isTranscribing) && (
           <aside className="flex flex-col gap-3 lg:sticky lg:top-24">
-            <div className="flex items-center justify-between gap-2">
-              <h2 className="text-lg font-semibold text-gray-900">Captions</h2>
-              {video.has_transcript && (
-                <div className="flex items-center gap-1.5">
-                  <button
-                    onClick={handlePolishCaptions}
-                    disabled={isPolishing || isRewriting}
-                    title="แก้คำผิดตามระบบคำ + ตัดบรรทัดสั้น + จัดเวลา (ไม่มีค่าใช้จ่าย)"
-                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
-                  >
-                    {isPolishing ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Wand2 className="w-3.5 h-3.5" strokeWidth={1.5} />}
-                    {isPolishing ? "Polishing..." : "Polish"}
-                  </button>
-                  <button
-                    onClick={handleRewriteCaptions}
-                    disabled={isRewriting || isPolishing}
-                    title="Fix typos & rewrite captions with AI"
-                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
-                  >
-                    {isRewriting ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Sparkles className="w-3.5 h-3.5" strokeWidth={1.5} />}
-                    {isRewriting ? "Rewriting..." : "Rewrite"}
-                  </button>
-                  <button
-                    onClick={handleDownloadSrt}
-                    title="Download SRT"
-                    className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 transition-colors"
-                  >
-                    <Download className="w-3.5 h-3.5" strokeWidth={1.5} />
-                    SRT
-                  </button>
-                </div>
-              )}
-            </div>
+            {video.has_transcript && (
+              // No "Captions" label needed here: the panel sits right next to the
+              // cue list, so a heading would only repeat what is already obvious.
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  onClick={handlePolishCaptions}
+                  disabled={isPolishing || isRewriting}
+                  title="แก้คำผิดตามระบบคำ + ตัดบรรทัดสั้น + จัดเวลา (ไม่มีค่าใช้จ่าย)"
+                  className="flex items-center gap-1.5 whitespace-nowrap border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                >
+                  {isPolishing ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Wand2 className="w-3.5 h-3.5" strokeWidth={1.5} />}
+                  {isPolishing ? "กำลังขัดคำ..." : "ขัดคำ"}
+                </button>
+                <button
+                  onClick={handleRewriteCaptions}
+                  disabled={isRewriting || isPolishing}
+                  title="แก้คำผิดและปรับคำบรรยายให้อ่านลื่นขึ้นด้วย AI (มีค่าใช้จ่าย)"
+                  className="flex items-center gap-1.5 whitespace-nowrap border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                >
+                  {isRewriting ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} /> : <Sparkles className="w-3.5 h-3.5" strokeWidth={1.5} />}
+                  {isRewriting ? "กำลังแก้ด้วย AI..." : "แก้ด้วย AI"}
+                </button>
+                <button
+                  onClick={() => {
+                    if (showFindReplace) closeFindReplace();
+                    else {
+                      setShowFindReplace(true);
+                      requestAnimationFrame(() => findInputRef.current?.focus());
+                    }
+                  }}
+                  title="ค้นหาและแทนที่คำในคำบรรยาย (Ctrl+F)"
+                  aria-expanded={showFindReplace}
+                  className={`flex items-center gap-1.5 whitespace-nowrap border px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                    showFindReplace
+                      ? "border-blue-500 bg-blue-50 text-blue-700"
+                      : "border-gray-300 text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  <Search className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  หาคำ/แทนที่
+                </button>
+                <button
+                  onClick={handleDownloadSrt}
+                  title="Download SRT"
+                  className="flex items-center gap-1.5 whitespace-nowrap border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  SRT
+                </button>
+              </div>
+            )}
 
             {isRewriting && (
               <p className="flex items-center gap-2 text-xs text-blue-600">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
-                Fixing typos and rewriting captions...
+                กำลังแก้คำผิดและปรับคำบรรยายด้วย AI...
               </p>
             )}
 
@@ -915,6 +1090,132 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                 แก้คำผิด ตัดบรรทัด และจัดเวลาใหม่...
               </p>
             )}
+
+            {/* Find & replace over the caption lines */}
+            {showFindReplace && video.has_transcript && (
+              <div className="flex flex-col gap-2 rounded-xl border border-blue-100 bg-blue-50/40 px-3 py-3">
+                <div className="flex items-center gap-1.5">
+                  <Search className="w-3.5 h-3.5 shrink-0 text-gray-400" strokeWidth={1.5} />
+                  <input
+                    ref={findInputRef}
+                    autoFocus
+                    value={findText}
+                    onChange={(e) => {
+                      setFindText(e.target.value);
+                      setMatchCursor(0);
+                      setReplaceNotice(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        jumpToMatch(e.shiftKey ? -1 : 1);
+                      }
+                    }}
+                    placeholder="ค้นหาคำ"
+                    className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+                  />
+                  <button
+                    onClick={() => jumpToMatch(-1)}
+                    disabled={!matchedIndexes.length}
+                    aria-label="บรรทัดก่อนหน้าที่พบ"
+                    title="บรรทัดก่อนหน้า (Shift+Enter)"
+                    className="shrink-0 rounded-md p-1.5 text-gray-500 hover:bg-white hover:text-gray-800 disabled:opacity-40 transition-colors"
+                  >
+                    <ChevronUp className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  </button>
+                  <button
+                    onClick={() => jumpToMatch(1)}
+                    disabled={!matchedIndexes.length}
+                    aria-label="บรรทัดถัดไปที่พบ"
+                    title="บรรทัดถัดไป (Enter)"
+                    className="shrink-0 rounded-md p-1.5 text-gray-500 hover:bg-white hover:text-gray-800 disabled:opacity-40 transition-colors"
+                  >
+                    <ChevronDown className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  </button>
+                  <button
+                    onClick={() => setMatchCase((v) => !v)}
+                    aria-pressed={matchCase}
+                    title="ตรงตามตัวพิมพ์ใหญ่-เล็ก"
+                    className={`shrink-0 rounded-md p-1.5 transition-colors ${
+                      matchCase
+                        ? "bg-blue-600 text-white"
+                        : "text-gray-500 hover:bg-white hover:text-gray-800"
+                    }`}
+                  >
+                    <CaseSensitive className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  </button>
+                  <button
+                    onClick={closeFindReplace}
+                    aria-label="ปิดการค้นหา"
+                    title="ปิด (Esc)"
+                    className="shrink-0 rounded-md p-1.5 text-gray-400 hover:bg-white hover:text-gray-700 transition-colors"
+                  >
+                    <X className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <Replace className="w-3.5 h-3.5 shrink-0 text-gray-400" strokeWidth={1.5} />
+                  <input
+                    value={replaceText}
+                    onChange={(e) => {
+                      setReplaceText(e.target.value);
+                      setReplaceNotice(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && findText && totalMatches > 0) {
+                        e.preventDefault();
+                        handleReplace("all");
+                      }
+                    }}
+                    placeholder="แทนที่ด้วย"
+                    className="min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+                  />
+                  <button
+                    onClick={() => handleReplace("all")}
+                    disabled={!findText || totalMatches === 0 || replacingScope !== null}
+                    title="แทนที่ทุกจุดที่พบ"
+                    className="flex shrink-0 items-center gap-1.5 rounded-full bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-40 transition-colors"
+                  >
+                    {replacingScope === "all" ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+                    ) : (
+                      <Check className="w-3.5 h-3.5" strokeWidth={1.5} />
+                    )}
+                    แทนที่ทั้งหมด
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                  <span className="text-gray-500">
+                    {!findText
+                      ? "พิมพ์คำที่ต้องการค้นหา"
+                      : totalMatches === 0
+                      ? "ไม่พบคำนี้ในคำบรรยาย"
+                      : `พบ ${totalMatches} จุด ใน ${matchedIndexes.length} บรรทัด` +
+                        (matchedIndexes.length > 1 ? ` · อยู่ที่ ${matchCursor + 1}/${matchedIndexes.length}` : "")}
+                  </span>
+                  <label className="flex items-center gap-1.5 text-gray-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={saveToGlossary}
+                      onChange={(e) => setSaveToGlossary(e.target.checked)}
+                      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500/30"
+                    />
+                    บันทึกคู่คำเข้าระบบคำ
+                  </label>
+                </div>
+
+                {replaceNotice && <p className="text-xs font-medium text-green-700">{replaceNotice}</p>}
+                <p className="text-[11px] text-gray-400">
+                  แทนที่แล้วบันทึกทับคำบรรยายทันที
+                </p>
+              </div>
+            )}
+
+            {/* The find & replace history panel is hidden from the UI per request —
+                every run is still recorded in `caption_replacements` on the backend and
+                readable via GET /api/videos/{id}/captions/replacements if needed later. */}
 
             {/* What the clean-up pass changed */}
             {video.polish_report && (
@@ -999,6 +1300,8 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                       category_label: rule.category_label,
                       rule_id: rule.rule_id,
                     }));
+                  const searchHits = showFindReplace ? countMatches(seg.text, findText, matchCase) : 0;
+                  const isCurrentMatch = searchHits > 0 && matchedIndexes[matchCursor] === i;
                   return (
                     <div
                       key={i}
@@ -1007,7 +1310,9 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                       }}
                       className={`group px-4 py-2.5 text-sm border-b border-gray-50 last:border-b-0 transition-colors ${
                         activeCueIndex === i && !isEditing ? "bg-blue-50 text-blue-900" : "text-gray-700"
-                      } ${isEditing ? "bg-white" : "hover:bg-gray-50"}`}
+                      } ${isEditing ? "bg-white" : "hover:bg-gray-50"} ${
+                        isCurrentMatch ? "ring-2 ring-inset ring-amber-300" : ""
+                      }`}
                     >
                       {isEditing ? (
                         <div className="flex flex-col gap-2">
@@ -1043,7 +1348,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                             <button
                               onClick={cancelEditingCue}
                               disabled={isSavingCue}
-                              className="flex items-center gap-1.5 border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
+                              className="flex items-center gap-1.5 whitespace-nowrap border border-gray-300 text-gray-700 px-3 py-1.5 rounded-full text-xs font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
                             >
                               <X className="w-3.5 h-3.5" strokeWidth={1.5} />
                               Cancel
@@ -1061,23 +1366,49 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                           >
                             <span className="text-gray-400 tabular-nums shrink-0">{formatTimestamp(seg.start)}</span>
                             <span className="whitespace-pre-wrap">
-                              {highlightSegments(seg.text, lineCorrections).map((part, k) =>
-                                part.category ? (
-                                  <mark
-                                    key={k}
-                                    title={`แก้จาก: ${
-                                      lineCorrections.find((c) => c.after === part.text)?.before ?? ""
-                                    }`}
-                                    className={`rounded px-0.5 border-b ${categoryClass(part.category)}`}
-                                  >
-                                    {part.text}
-                                  </mark>
-                                ) : (
-                                  <span key={k}>{part.text}</span>
-                                )
-                              )}
+                              {searchHits > 0
+                                ? // While searching, the hits are what matters on this line.
+                                  splitOnMatches(seg.text, findText, matchCase).map((part, k) =>
+                                    part.isMatch ? (
+                                      <mark key={k} className="rounded bg-amber-200 px-0.5 text-gray-900">
+                                        {part.text}
+                                      </mark>
+                                    ) : (
+                                      <span key={k}>{part.text}</span>
+                                    )
+                                  )
+                                : highlightSegments(seg.text, lineCorrections).map((part, k) =>
+                                    part.category ? (
+                                      <mark
+                                        key={k}
+                                        title={`แก้จาก: ${
+                                          lineCorrections.find((c) => c.after === part.text)?.before ?? ""
+                                        }`}
+                                        className={`rounded px-0.5 border-b ${categoryClass(part.category)}`}
+                                      >
+                                        {part.text}
+                                      </mark>
+                                    ) : (
+                                      <span key={k}>{part.text}</span>
+                                    )
+                                  )}
                             </span>
                           </button>
+                          {searchHits > 0 && (
+                            <button
+                              onClick={() => handleReplace(i)}
+                              disabled={replacingScope !== null}
+                              title={`แทนที่เฉพาะบรรทัดนี้ (${searchHits} จุด)`}
+                              className="flex shrink-0 items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-40 transition-colors"
+                            >
+                              {replacingScope === i ? (
+                                <Loader2 className="w-3 h-3 animate-spin" strokeWidth={1.5} />
+                              ) : (
+                                <Replace className="w-3 h-3" strokeWidth={1.5} />
+                              )}
+                              แทนที่
+                            </button>
+                          )}
                           <button
                             onClick={() => startEditingCue(i, seg.text)}
                             aria-label={`Edit caption at ${formatTimestamp(seg.start)}`}

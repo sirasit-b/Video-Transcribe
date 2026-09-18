@@ -41,6 +41,8 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Split long blocks into short subtitle lines (~42-52 chars) on real Thai word boundaries
 - Preview synced captions alongside video playback (click-to-seek cue list + native subtitle track)
 - Edit any caption line by hand to fix ASR typos
+- Find & replace across the captions (Ctrl+F), one line at a time or all at once,
+  keeping a before/after history and optionally teaching the pair to the word system
 
 ## Prerequisites
 
@@ -128,7 +130,8 @@ npm run dev
 
 Base URL: `http://localhost:8734`
 
-- `POST /api/videos` - upload video file
+- `POST /api/videos?filename=<name>&project_id=<id>` - upload a video: the request body is the
+  raw file bytes (not multipart), streamed straight to disk — see [Uploads](#uploads)
 - `GET /api/videos` - list all videos
 - `GET /api/videos/{video_id}` - get video
 - `GET /api/videos/stream/{filename}` - stream video
@@ -143,6 +146,9 @@ Base URL: `http://localhost:8734`
 - `GET /api/videos/{video_id}/captions.vtt` - WebVTT captions (for the video `<track>` element)
 - `GET /api/videos/{video_id}/captions.srt` - SRT captions (download)
 - `PATCH /api/videos/{video_id}/captions/{segment_index}` - edit one caption line (`{"text": "..."}`)
+- `POST /api/videos/{video_id}/captions/replace` - find & replace over the caption lines
+  (`{"find": "...", "replace": "...", "match_case": false, "segment_indexes": null, "save_to_glossary": true}`)
+- `GET /api/videos/{video_id}/captions/replacements` - every find & replace run on this video, newest first
 - `GET /api/glossary` - the compiled word system: rules, protected terms, counts
 - `POST /api/glossary` - add or override a rule (`{"right": "best.pt", "wrong": ["base.pt"], "category": "filename"}`)
 - `PATCH /api/glossary/{rule_id}` - enable/disable a rule, built-ins included (`{"enabled": false}`)
@@ -153,6 +159,21 @@ Interactive docs:
 
 - Swagger UI: `/docs`
 - ReDoc: `/redoc`
+
+## Uploads
+
+Pick several files at once from **Upload Videos**, or drop them anywhere on the header — both
+paths accept multiple files and upload up to 4 at a time concurrently, each with its own
+progress bar; a failed one shows why and stays until dismissed, a finished one clears itself.
+
+`POST /api/videos` takes the file as the raw request body instead of a multipart form, with
+the name and target project passed as query params (`?filename=<name>&project_id=<id>`). This
+is what makes uploads fast: the old multipart endpoint spooled the file to a temp location
+first and then copied *that* into `videos/` — every upload touched disk twice — and did the
+copy with a blocking call inside an `async def`, which stalled the entire worker (every other
+request on it, uploads included) until it finished. Streaming the body directly is a single
+disk write, and awaiting it chunk by chunk hands control back between chunks, so uploads —
+concurrent or not — no longer block each other or anything else the server is doing.
 
 ## Transcription Models
 
@@ -213,6 +234,23 @@ protected so nothing converts it, and try the whole system against a sample line
 relying on it. Built-in rules live in `glossary.py`; your changes are rows in
 `glossary_rules` and are scoped to your user.
 
+### Find & replace
+
+**ค้นหา/แทนที่** (or Ctrl+F) on the video page searches the caption lines and marks every
+hit. The match count updates as you type; Enter and Shift+Enter walk between the lines that
+matched, and **Aa** makes the search case-sensitive. Replace everything at once with
+**แทนที่ทั้งหมด**, or use the per-line button to change a single cue.
+
+Every run is saved to `caption_replacements` as the word before and after, how many places
+changed, and when — the history panel under the search box lists them newest first, and
+`GET /api/videos/{id}/captions/replacements` returns the same rows. Leaving
+**บันทึกคู่คำเข้าระบบคำ** checked also teaches the pair to the word system, so the next
+transcript fixes it without being asked. An existing rule for that spelling is extended
+rather than duplicated, whatever category it sits in.
+
+Replacement is literal, not a regex, and a change that would leave a caption line empty is
+refused rather than producing a broken cue.
+
 ## Cost and Time Reporting
 
 Every run reports both. Before transcribing, the video page shows the projected duration
@@ -240,9 +278,9 @@ python pipeline.py video.mp4 --no-polish
    automatically; the actual time and cost appear when it finishes.
 4. Open the report panel to see every word that was corrected, grouped by rule.
 5. Preview the synced caption list, or toggle native subtitles on the player.
-6. Click the pencil (or double-click a cue) to hand-fix any remaining line. If a word was
-   mis-transcribed in a way the system missed, add it in **ระบบคำ** and hit **Polish**
-   so it is fixed everywhere at once.
+6. Click the pencil (or double-click a cue) to hand-fix any remaining line. If the same
+   wrong word appears in several places, hit Ctrl+F and replace it everywhere at once —
+   leave **บันทึกคู่คำเข้าระบบคำ** checked and the next transcript fixes it by itself.
 7. Extract frames as needed.
 
 ## Troubleshooting

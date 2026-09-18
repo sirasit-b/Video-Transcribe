@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import axios from "axios";
-import { Upload, Loader2, AlertCircle, Film, Trash2, Search, Plus, GripVertical, X, Check } from "lucide-react";
+import { Upload, Loader2, AlertCircle, Film, Trash2, Search, Plus, GripVertical, X, Check, CircleX } from "lucide-react";
 import { api } from "./lib/api";
 
 interface VideoItem {
@@ -23,13 +23,26 @@ interface ProjectItem {
 
 type Tab = "all" | "ungrouped" | number;
 
+interface UploadTask {
+  id: string;
+  name: string;
+  progress: number;
+  status: "pending" | "uploading" | "done" | "error";
+  error?: string;
+}
+
+// How many files upload at once. High enough that a batch actually saturates the
+// connection instead of trickling in one at a time, low enough not to make the
+// browser (or the server) juggle dozens of simultaneous multi-GB streams.
+const MAX_CONCURRENT_UPLOADS = 4;
+
 export default function Home() {
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
+  const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [movingId, setMovingId] = useState<number | null>(null);
   const [search, setSearch] = useState("");
@@ -73,32 +86,73 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
-  const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setUploading(true);
-    setError(null);
-
-    const formData = new FormData();
-    formData.append("file", file);
-    if (typeof activeTab === "number") {
-      formData.append("project_id", String(activeTab));
-    }
-
+  /** One file's upload: the request body is the raw file, not multipart — the server
+   *  streams it straight to disk, which is what makes this fast, and it lets a plain
+   *  byte-progress callback drive the bar below instead of an approximate multipart one. */
+  const uploadOneFile = async (task: UploadTask, file: File, projectId: Tab) => {
+    setUploadTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: "uploading" } : t)));
     try {
-      const res = await api.post<VideoItem>("/videos", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+      const params: Record<string, string | number> = { filename: file.name };
+      if (typeof projectId === "number") params.project_id = projectId;
+
+      const res = await api.post<VideoItem>("/videos", file, {
+        params,
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        onUploadProgress: (evt) => {
+          const progress = evt.total ? Math.round((evt.loaded / evt.total) * 100) : 0;
+          setUploadTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, progress } : t)));
+        },
       });
       setVideos((prev) => [res.data, ...prev]);
-      if (typeof activeTab === "number") loadProjects();
+      if (typeof projectId === "number") loadProjects();
+      setUploadTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: "done", progress: 100 } : t)));
+      // Nothing left pointing at it after this — clear the row so a batch of uploads
+      // doesn't leave a permanent checklist behind once everything has succeeded.
+      setTimeout(() => {
+        setUploadTasks((prev) => prev.filter((t) => t.id !== task.id));
+      }, 2000);
     } catch (err) {
       console.error(err);
-      setError("Failed to upload video.");
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setUploadTasks((prev) =>
+        prev.map((t) => (t.id === task.id ? { ...t, status: "error", error: detail || "Upload failed" } : t))
+      );
     }
+  };
+
+  /** Runs the batch with only `MAX_CONCURRENT_UPLOADS` requests in flight at once: a
+   *  fixed pool of workers each pulling the next file off the shared queue, rather than
+   *  firing every upload at the same time or doing them one after another. */
+  const uploadFiles = (files: File[], projectId: Tab) => {
+    if (files.length === 0) return;
+    setError(null);
+
+    const tasks: UploadTask[] = files.map((file) => ({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      name: file.name,
+      progress: 0,
+      status: "pending",
+    }));
+    setUploadTasks((prev) => [...prev, ...tasks]);
+
+    let next = 0;
+    const worker = async () => {
+      while (next < files.length) {
+        const index = next++;
+        await uploadOneFile(tasks[index], files[index], projectId);
+      }
+    };
+    Array.from({ length: Math.min(MAX_CONCURRENT_UPLOADS, files.length) }, worker);
+  };
+
+  const dismissUploadTask = (id: string) => {
+    setUploadTasks((prev) => prev.filter((t) => t.id !== id));
+  };
+
+  const handleFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    uploadFiles(files, activeTab);
   };
 
   const handleDelete = async (e: React.MouseEvent, video: VideoItem) => {
@@ -197,33 +251,79 @@ export default function Home() {
       active ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
     }`;
 
+  const activeUploads = uploadTasks.filter((t) => t.status === "pending" || t.status === "uploading");
+  const isUploading = activeUploads.length > 0;
+
   return (
     <main className="flex-1 max-w-3xl w-full mx-auto px-8 py-16 flex flex-col gap-8">
-      <div className="flex items-start justify-between gap-6">
+      <div
+        className="flex items-start justify-between gap-6 rounded-2xl transition-colors"
+        onDragOver={(e) => {
+          e.preventDefault();
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          uploadFiles(Array.from(e.dataTransfer.files), activeTab);
+        }}
+      >
         <div>
           <h1 className="text-4xl font-semibold tracking-tight text-gray-900">Videos</h1>
-          <p className="text-gray-500 mt-2">Upload a video to transcribe and extract frames.</p>
+          <p className="text-gray-500 mt-2">
+            Upload videos to transcribe and extract frames — pick several at once, or drop them here.
+          </p>
         </div>
         <button
           onClick={() => fileInputRef.current?.click()}
-          disabled={uploading}
+          disabled={isUploading}
           className="shrink-0 bg-blue-600 text-white px-5 py-2.5 rounded-full font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 transition-colors"
         >
-          {uploading ? (
+          {isUploading ? (
             <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
           ) : (
             <Upload className="w-4 h-4" strokeWidth={1.5} />
           )}
-          {uploading ? "Uploading..." : "Upload Video"}
+          {isUploading ? `Uploading (${activeUploads.length})...` : "Upload Videos"}
         </button>
         <input
           ref={fileInputRef}
           type="file"
           accept="video/*"
+          multiple
           className="hidden"
           onChange={handleFileSelected}
         />
       </div>
+
+      {uploadTasks.length > 0 && (
+        <div className="flex flex-col gap-1.5 rounded-xl border border-gray-100 bg-gray-50/60 px-4 py-3">
+          {uploadTasks.map((task) => (
+            <div key={task.id} className="flex items-center gap-3 text-sm">
+              <span className="flex-1 min-w-0 truncate text-gray-700" title={task.name}>
+                {task.name}
+              </span>
+              {task.status === "error" ? (
+                <span className="shrink-0 text-xs text-red-600">{task.error || "Upload failed"}</span>
+              ) : task.status === "done" ? (
+                <Check className="w-4 h-4 shrink-0 text-green-600" strokeWidth={1.5} />
+              ) : (
+                <div className="w-28 shrink-0 h-1.5 rounded-full bg-gray-200 overflow-hidden">
+                  <div
+                    className="h-full bg-blue-600 transition-all"
+                    style={{ width: `${task.progress}%` }}
+                  />
+                </div>
+              )}
+              <button
+                onClick={() => dismissUploadTask(task.id)}
+                aria-label={`Dismiss ${task.name}`}
+                className="shrink-0 p-0.5 rounded-full text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+              >
+                <CircleX className="w-3.5 h-3.5" strokeWidth={1.5} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="flex items-center gap-2 flex-wrap">
         <button onClick={() => setActiveTab("all")} className={tabButtonClass(activeTab === "all")}>
