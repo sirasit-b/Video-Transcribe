@@ -1,0 +1,21 @@
+# GPU rendering on Intel or AMD graphics (VAAPI / Quick Sync).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d
+#
+# The render node is all ffmpeg needs. After starting, check what was actually
+# picked up:  curl http://localhost:8734/api/auto-trim/capabilities
+#
+# Docker Desktop on Windows and macOS cannot pass a GPU through this way; this is
+# for a Linux host.
+services:
+  auto-trim:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      # The render group owns /dev/dri/renderD*; without it the device is there
+      # but not usable. Replace with the host's own render GID if it differs
+      # (stat -c %g /dev/dri/renderD128).
+      - "video"
+      - "render"
+    environment:
+      - VAAPI_DEVICE=/dev/dri/renderD128

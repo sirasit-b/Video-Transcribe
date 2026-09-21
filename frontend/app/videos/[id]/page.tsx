@@ -30,6 +30,8 @@ import {
   CaseSensitive,
   ChevronUp,
   ChevronDown,
+  Scissors,
+  Cpu,
 } from "lucide-react";
 import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
@@ -112,6 +114,78 @@ interface TranscribeEstimate {
   is_estimate_only: boolean;
 }
 
+/** What an auto trim keeps: the numbers the service reports for one edit. */
+interface TrimAnalysis {
+  fps: number;
+  threshold: number;
+  margin_start: number;
+  margin_end: number;
+  mincut: number;
+  minclip: number;
+  total_frames: number;
+  kept_frames: number;
+  removed_frames: number;
+  timeline_duration: number;
+  source_duration: number;
+  output_duration: number;
+  removed_duration: number;
+  removed_ratio: number;
+  segment_count: number;
+  analyze_seconds: number;
+}
+
+/** A trim that was actually rendered, as stored on the video. */
+interface TrimResult extends TrimAnalysis {
+  output_filename: string;
+  output_bytes: number;
+  render_seconds: number;
+  elapsed_seconds: number;
+  created_at: string;
+  chunks?: number;
+  workers?: number;
+}
+
+/** What the trim service can encode with on its machine. */
+interface TrimCapabilities {
+  cpu_model: string;
+  cpu_cores: number;
+  devices: string[];
+  chosen: string;
+  hardware: boolean;
+  pipeline: string;
+}
+
+/** How long a trim is expected to take, per phase. */
+interface TrimEstimate {
+  analyze_seconds: number;
+  render_seconds: number;
+  audio_seconds: number;
+  finish_seconds: number;
+  total_seconds: number;
+  is_upper_bound: boolean;
+  duration: number;
+  kept_duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  workers: number;
+}
+
+/** A trim job in flight, as the service reports it. */
+interface TrimJob {
+  job_id: string | null;
+  mode?: "analyze" | "trim";
+  state: "running" | "canceling" | "done" | "failed" | "canceled" | "none" | "expired";
+  phase?: string;
+  progress?: number;
+  elapsed_seconds?: number;
+  eta_seconds?: number | null;
+  estimate?: TrimEstimate | null;
+  analysis?: TrimAnalysis | null;
+  result?: TrimResult | null;
+  error?: string | null;
+}
+
 interface VideoData {
   id: number;
   filename: string;
@@ -122,6 +196,9 @@ interface VideoData {
   transcribe_stats: RunStats | null;
   polish_report: PolishReport | null;
   rewrite_stats: RunStats | null;
+  trim_filename: string | null;
+  trim_result: TrimResult | null;
+  trim_job_id: string | null;
 }
 
 interface TranscribeModel {
@@ -156,6 +233,12 @@ function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 function formatCost(usd: number): string {
@@ -239,6 +322,14 @@ interface FrameItem {
 
 const MODEL_KEY = "vt_transcribe_model";
 
+const TRIM_PHASE_LABELS: Record<string, string> = {
+  queued: "เข้าคิว",
+  analyzing: "วิเคราะห์เสียง",
+  rendering: "เรนเดอร์",
+  finishing: "รวมไฟล์",
+  finished: "เสร็จแล้ว",
+};
+
 function formatTimestamp(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
@@ -286,6 +377,24 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [isDownloadingAll, setIsDownloadingAll] = useState(false);
   const [isDownloadingSelected, setIsDownloadingSelected] = useState(false);
   const [activeFrameIndex, setActiveFrameIndex] = useState<number | null>(null);
+
+  // Auto trim. The threshold is shown as a percentage because that is how a
+  // loudness gate reads to a person; the API takes a 0-1 fraction.
+  const [trimThreshold, setTrimThreshold] = useState("4");
+  const [trimMargin, setTrimMargin] = useState("0.2");
+  const [trimPreview, setTrimPreview] = useState<TrimAnalysis | null>(null);
+  const [trimEstimate, setTrimEstimate] = useState<TrimEstimate | null>(null);
+  const [trimCapabilities, setTrimCapabilities] = useState<TrimCapabilities | null>(null);
+  // Why this video cannot be trimmed at all (too long, no audio track). Known
+  // from the estimate, so the panel can say so before anything is clicked.
+  const [trimBlocked, setTrimBlocked] = useState<string | null>(null);
+  const [trimJob, setTrimJob] = useState<TrimJob | null>(null);
+  const [startingTrim, setStartingTrim] = useState<"analyze" | "trim" | null>(null);
+  const [isCancelingTrim, setIsCancelingTrim] = useState(false);
+  const [isDeletingTrim, setIsDeletingTrim] = useState(false);
+  // Bumped after each render so the player reloads instead of showing the
+  // previous trim from cache at the same URL.
+  const [trimVersion, setTrimVersion] = useState(0);
 
   const [isRenaming, setIsRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
@@ -409,6 +518,75 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     } catch (err) {
       console.error(err);
       setError("Failed to download SRT");
+    }
+  };
+
+  /** The trim settings to send, or null when a field is not a usable number. */
+  const readTrimSettings = () => {
+    const threshold = Number.parseFloat(trimThreshold);
+    const margin = Number.parseFloat(trimMargin);
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+      setError("ความดังขั้นต่ำต้องอยู่ระหว่าง 0 ถึง 100 เปอร์เซ็นต์");
+      return null;
+    }
+    if (!Number.isFinite(margin) || margin < 0 || margin > 10) {
+      setError("ค่าเผื่อหัวท้ายต้องอยู่ระหว่าง 0 ถึง 10 วินาที");
+      return null;
+    }
+    return { threshold: threshold / 100, margin_start: margin, margin_end: margin };
+  };
+
+  /** Start an analyze-only or a full trim job, and let the poller take over. */
+  const startTrimJob = async (mode: "analyze" | "trim") => {
+    const settings = readTrimSettings();
+    if (!settings) return;
+
+    setStartingTrim(mode);
+    setError(null);
+    try {
+      const path = mode === "analyze" ? "auto-trim/preview" : "auto-trim";
+      const res = await api.post<TrimJob>(`/videos/${videoId}/${path}`, settings);
+      setTrimJob(res.data);
+      if (mode === "analyze") setTrimPreview(null);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(
+        detail || (mode === "analyze" ? "วิเคราะห์ช่วงเงียบไม่สำเร็จ" : "เริ่มงานตัดวิดีโอไม่สำเร็จ")
+      );
+    } finally {
+      setStartingTrim(null);
+    }
+  };
+
+  const handleCancelTrim = async () => {
+    setIsCancelingTrim(true);
+    try {
+      const res = await api.delete<TrimJob>(`/videos/${videoId}/auto-trim/job`);
+      setTrimJob(res.data.job_id ? res.data : null);
+    } catch (err) {
+      console.error(err);
+      setError("ยกเลิกงานไม่สำเร็จ");
+    } finally {
+      setIsCancelingTrim(false);
+    }
+  };
+
+  const handleDeleteTrimmed = async () => {
+    if (!confirm("ลบไฟล์ที่ตัดแล้ว? (ไฟล์ต้นฉบับยังอยู่)")) return;
+
+    setIsDeletingTrim(true);
+    setError(null);
+    try {
+      await api.delete(`/videos/${videoId}/trimmed`);
+      setVideo((current) =>
+        current ? { ...current, trim_filename: null, trim_result: null } : current
+      );
+    } catch (err) {
+      console.error(err);
+      setError("ลบไฟล์ที่ตัดไม่สำเร็จ");
+    } finally {
+      setIsDeletingTrim(false);
     }
   };
 
@@ -644,6 +822,17 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
 
     (async () => {
       try {
+        const res = await api.get<TrimCapabilities>(`/auto-trim/capabilities`);
+        if (active) setTrimCapabilities(res.data);
+      } catch (err) {
+        // Only decoration for the panel; a service that cannot answer will say so
+        // through the estimate instead.
+        console.error(err);
+      }
+    })();
+
+    (async () => {
+      try {
         const res = await api.get<TranscribeModel[]>(`/transcribe-models`);
         if (!active) return;
         setTranscribeModels(res.data);
@@ -660,6 +849,85 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
       active = false;
     };
   }, [videoId]);
+
+  // The job to poll: the one this tab started, or — before it has started any —
+  // whatever the video row says is still running, so a job left behind by a closed
+  // tab is picked back up rather than lost.
+  const activeTrimJobId = trimJob
+    ? trimJob.state === "running" || trimJob.state === "canceling"
+      ? trimJob.job_id
+      : null
+    : video?.trim_job_id ?? null;
+  const trimJobActive = activeTrimJobId !== null;
+
+  // Poll the running job for phase, progress and ETA. A finished trim is committed
+  // by the backend on the same poll, so the refreshed video carries the result.
+  useEffect(() => {
+    if (!activeTrimJobId) return;
+    let stopped = false;
+
+    const poll = async () => {
+      try {
+        const res = await api.get<TrimJob>(`/videos/${videoId}/auto-trim/job`, {
+          params: { job_id: activeTrimJobId },
+        });
+        if (stopped) return;
+
+        const status = res.data;
+        setTrimJob(status);
+        if (status.analysis) setTrimPreview(status.analysis);
+        if (status.state === "failed") setError(status.error || "งานตัดวิดีโอล้มเหลว");
+        if (status.state === "done" && status.mode === "trim") {
+          const refreshed = await api.get(`/videos/${videoId}`);
+          if (stopped) return;
+          setVideo(refreshed.data);
+          setTrimVersion((v) => v + 1);
+        }
+      } catch (err) {
+        console.error(err);
+        if (!stopped) setTrimJob(null);
+      }
+    };
+
+    poll();
+    const timer = setInterval(poll, 1200);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [activeTrimJobId, videoId]);
+
+  // How long a trim would take. Nothing is decoded for this, so it can be asked
+  // for on load; once a preview has measured the kept share, it gets sharper.
+  const trimKeptRatio = trimPreview ? Math.max(0, 1 - trimPreview.removed_ratio) : null;
+  const loadedVideoId = video?.id ?? null;
+  useEffect(() => {
+    if (loadedVideoId === null || trimJobActive) return;
+    let active = true;
+
+    (async () => {
+      try {
+        const res = await api.get<TrimEstimate>(`/videos/${videoId}/auto-trim/estimate`, {
+          params: trimKeptRatio === null ? {} : { kept_ratio: trimKeptRatio },
+        });
+        if (!active) return;
+        setTrimEstimate(res.data);
+        setTrimBlocked(null);
+      } catch (err) {
+        if (!active) return;
+        setTrimEstimate(null);
+        // A 4xx here is the reason this video cannot be trimmed; anything else is
+        // a service problem the panel should not editorialise about.
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+        setTrimBlocked(status && status < 500 && detail ? detail : null);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [videoId, loadedVideoId, trimJobActive, trimKeptRatio]);
 
   // Pre-flight estimate for the chosen model, so the cost is on screen before the
   // click. Only meaningful while the video has no transcript yet.
@@ -1430,6 +1698,229 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
               </p>
             )}
           </aside>
+        )}
+      </div>
+
+      {/* Auto trim: render the video with its silent parts cut out */}
+      <div className="flex flex-col gap-4 pt-8 border-t border-gray-100">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">ตัดช่วงเงียบอัตโนมัติ</h2>
+            <p className="text-sm text-gray-500 mt-1 max-w-xl">
+              วัดความดังทุกเฟรม ตัดช่วงที่เบากว่าค่าที่ตั้งไว้ออก แล้วเผื่อหัวท้ายแต่ละช่วงไว้ให้ฟังลื่น
+              (อัลกอริทึมเดียวกับ auto-editor) ไฟล์ต้นฉบับไม่ถูกแตะ ผลลัพธ์เป็นไฟล์ใหม่
+            </p>
+          </div>
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1 text-xs text-gray-500">
+              ความดังขั้นต่ำ (%)
+              <input
+                type="number"
+                min={0}
+                max={100}
+                step={0.5}
+                value={trimThreshold}
+                onChange={(e) => setTrimThreshold(e.target.value)}
+                disabled={trimJobActive}
+                className="w-24 border border-gray-200 rounded-full px-4 py-2 text-sm text-center text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 disabled:opacity-50"
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-gray-500">
+              เผื่อหัวท้าย (วินาที)
+              <input
+                type="number"
+                min={0}
+                max={10}
+                step={0.05}
+                value={trimMargin}
+                onChange={(e) => setTrimMargin(e.target.value)}
+                disabled={trimJobActive}
+                className="w-24 border border-gray-200 rounded-full px-4 py-2 text-sm text-center text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 disabled:opacity-50"
+              />
+            </label>
+            <button
+              onClick={() => startTrimJob("analyze")}
+              disabled={trimJobActive || startingTrim !== null || trimBlocked !== null}
+              title="ดูว่าจะตัดออกเท่าไหร่ ก่อนเสียเวลาเรนเดอร์"
+              className="border border-gray-300 text-gray-700 px-5 py-2 rounded-full text-sm font-medium hover:bg-gray-50 disabled:opacity-50 flex items-center gap-2 transition-colors"
+            >
+              {startingTrim === "analyze" ? (
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+              ) : (
+                <Search className="w-4 h-4" strokeWidth={1.5} />
+              )}
+              วิเคราะห์
+            </button>
+            <button
+              onClick={() => startTrimJob("trim")}
+              disabled={trimJobActive || startingTrim !== null || trimBlocked !== null}
+              title="ตัดช่วงเงียบออกแล้วเรนเดอร์เป็นไฟล์ใหม่"
+              className="bg-blue-600 text-white px-5 py-2 rounded-full text-sm font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 transition-colors"
+            >
+              {startingTrim === "trim" ? (
+                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+              ) : (
+                <Scissors className="w-4 h-4" strokeWidth={1.5} />
+              )}
+              {video.trim_filename ? "ตัดใหม่" : "ตัดอัตโนมัติ"}
+            </button>
+          </div>
+        </div>
+
+        {trimBlocked && (
+          <p className="flex items-center gap-2 text-sm text-amber-700">
+            <AlertCircle className="w-4 h-4" strokeWidth={1.5} />
+            {trimBlocked}
+          </p>
+        )}
+
+        {/* What it will cost in time, before anything is started. */}
+        {trimEstimate && !trimJobActive && !trimBlocked && (
+          <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
+            <span className="flex items-center gap-1">
+              <Clock className="w-3.5 h-3.5" strokeWidth={1.5} />
+              ตัดทั้งคลิปประมาณ {formatDuration(trimEstimate.total_seconds)}
+              {trimEstimate.is_upper_bound ? " (อย่างช้าสุด)" : ""}
+            </span>
+            <span className="text-gray-400">
+              วิเคราะห์ ~{formatDuration(trimEstimate.analyze_seconds)} · เรนเดอร์ ~
+              {formatDuration(Math.max(trimEstimate.render_seconds, trimEstimate.audio_seconds))}
+            </span>
+            <span className="text-gray-400">
+              {trimEstimate.width}x{trimEstimate.height} · {trimEstimate.fps.toFixed(2)} fps ·
+              ความยาว {formatDuration(trimEstimate.duration)} · ขนานได้ {trimEstimate.workers} งาน
+            </span>
+            {trimCapabilities && (
+              <span
+                title={`${trimCapabilities.cpu_model} · ${trimCapabilities.cpu_cores} cores · ${trimCapabilities.pipeline}`}
+                className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 ${
+                  trimCapabilities.hardware
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                    : "border-gray-200 bg-gray-50 text-gray-500"
+                }`}
+              >
+                <Cpu className="w-3 h-3" strokeWidth={1.5} />
+                {trimCapabilities.hardware ? "GPU" : "CPU"} · {trimCapabilities.chosen}
+              </span>
+            )}
+          </p>
+        )}
+
+        {/* The bar. Its pace is weighted by each phase's expected time, so it
+            moves evenly instead of stalling through the encode. */}
+        {trimJobActive && trimJob && (
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-gray-600">
+              <span className="flex items-center gap-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+                <span className="font-medium text-gray-900">
+                  {trimJob.state === "canceling"
+                    ? "กำลังยกเลิก..."
+                    : TRIM_PHASE_LABELS[trimJob.phase ?? ""] ?? "กำลังทำงาน"}
+                </span>
+                {Math.round((trimJob.progress ?? 0) * 100)}%
+                {trimJob.mode === "analyze" ? " · วิเคราะห์เท่านั้น" : ""}
+              </span>
+              <span className="flex items-center gap-3">
+                <span className="text-gray-400">
+                  ผ่านไป {formatDuration(trimJob.elapsed_seconds ?? 0)}
+                  {trimJob.eta_seconds != null
+                    ? ` · เหลือ ~${formatDuration(trimJob.eta_seconds)}`
+                    : ""}
+                </span>
+                <button
+                  onClick={handleCancelTrim}
+                  disabled={isCancelingTrim || trimJob.state === "canceling"}
+                  className="flex items-center gap-1.5 text-gray-500 hover:text-red-600 disabled:opacity-50 transition-colors"
+                >
+                  <X className="w-3.5 h-3.5" strokeWidth={1.5} />
+                  ยกเลิก
+                </button>
+              </span>
+            </div>
+            <div className="h-2 w-full rounded-full bg-gray-100 overflow-hidden">
+              <div
+                className="h-full rounded-full bg-blue-600 transition-[width] duration-700 ease-out"
+                style={{ width: `${Math.max(2, Math.round((trimJob.progress ?? 0) * 100))}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {trimPreview && !trimJobActive && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl bg-gray-50 px-4 py-2.5 text-xs text-gray-600">
+            <span className="font-medium text-gray-900">
+              เหลือ {formatDuration(trimPreview.output_duration)} จาก{" "}
+              {formatDuration(trimPreview.timeline_duration)}
+            </span>
+            <span>
+              ตัดออก {formatDuration(trimPreview.removed_duration)} (
+              {Math.round(trimPreview.removed_ratio * 100)}%)
+            </span>
+            <span className="text-gray-400">
+              {trimPreview.segment_count} ช่วงที่เก็บไว้ · {trimPreview.fps.toFixed(2)} fps
+            </span>
+            <span className="text-gray-400">
+              ขั้นต่ำ {(trimPreview.threshold * 100).toFixed(1)}% · เผื่อ {trimPreview.margin_start}s/
+              {trimPreview.margin_end}s · mincut {trimPreview.mincut}s · minclip {trimPreview.minclip}s
+            </span>
+            <span className="flex items-center gap-1">
+              <Clock className="w-3.5 h-3.5" strokeWidth={1.5} />
+              วิเคราะห์ {formatDuration(trimPreview.analyze_seconds)}
+            </span>
+          </div>
+        )}
+
+        {video.trim_filename && video.trim_result && !trimJobActive && (
+          <div className="grid lg:grid-cols-[1fr_320px] gap-6 items-start pt-1">
+            <div className="aspect-video bg-black rounded-2xl overflow-hidden">
+              <video
+                key={trimVersion}
+                src={withAuthToken(`${MEDIA_BASE}/api/videos/${videoId}/trimmed?v=${trimVersion}`)}
+                controls
+                className="w-full h-full object-contain"
+              />
+            </div>
+            <div className="flex flex-col gap-2 text-xs text-gray-600">
+              <p className="text-sm font-medium text-gray-900">ไฟล์ที่ตัดแล้ว</p>
+              <p>
+                ความยาว {formatDuration(video.trim_result.output_duration)} ·{" "}
+                {formatBytes(video.trim_result.output_bytes)}
+              </p>
+              <p className="text-gray-400">
+                ตัดออก {formatDuration(video.trim_result.removed_duration)} ·{" "}
+                {video.trim_result.segment_count} ช่วง
+              </p>
+              <p className="text-gray-400">
+                เรนเดอร์ {formatDuration(video.trim_result.render_seconds)}
+                {video.trim_result.chunks && video.trim_result.chunks > 1
+                  ? ` (ขนาน ${video.trim_result.chunks} ท่อน)`
+                  : ""}{" "}
+                · ทั้งงาน {formatDuration(video.trim_result.elapsed_seconds)}
+              </p>
+              <div className="flex flex-wrap gap-2 pt-2">
+                <a
+                  href={withAuthToken(`${MEDIA_BASE}/api/videos/${videoId}/trimmed?download=1`)}
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <Download className="w-4 h-4" strokeWidth={1.5} />
+                  ดาวน์โหลด
+                </a>
+                <button
+                  onClick={handleDeleteTrimmed}
+                  disabled={isDeletingTrim}
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-red-50 hover:text-red-600 disabled:opacity-50 transition-colors"
+                >
+                  {isDeletingTrim ? (
+                    <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                  ) : (
+                    <Trash2 className="w-4 h-4" strokeWidth={1.5} />
+                  )}
+                  ลบไฟล์ที่ตัด
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
 

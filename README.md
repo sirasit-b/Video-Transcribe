@@ -7,7 +7,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Frontend: Next.js 16 + React 19
 - Backend: FastAPI + SQLAlchemy
 - Database: PostgreSQL 15
-- Media processing: FFmpeg, with frame extraction offloaded to a Rust service in Docker
+- Media processing: FFmpeg, with frame extraction and auto trim offloaded to Rust services in Docker
 - AI: OpenAI speech-to-text (`gpt-transcribe`, `whisper-1`, ...), picked per run; OpenAI `gpt-5` for optional caption proofreading
 - Thai text processing: PyThaiNLP (`newmm`) for word boundaries when splitting caption lines
 
@@ -23,8 +23,11 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 |-- caption_polish.py       # Line splitting, spacing repair, timestamp sanitising
 |-- pricing.py              # Per-run time and cost estimates
 |-- docker-compose.yml      # Multi-service local stack
+|-- docker-compose.vaapi.yml   # Overlay: pass an Intel/AMD GPU to the trim service
+|-- docker-compose.nvidia.yml  # Overlay: pass an NVIDIA GPU to the trim service
 |-- Dockerfile              # Backend image
 |-- frame-extractor-rs/     # Rust microservice for frame extraction
+|-- auto-trim-rs/           # Rust microservice for auto trim (auto-editor's cut, ported)
 |-- frontend/               # Next.js app
 |-- videos/                 # Uploaded video files
 `-- texts/                  # Generated transcript and .srt files
@@ -35,6 +38,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Upload videos directly, no grouping required
 - Stream uploaded videos
 - Extract evenly spaced frames from videos
+- Cut the silent parts out of a video with one button, using auto-editor's edit decision
 - Transcribe video audio to Thai text with per-segment timestamps, choosing the model per run
 - See the projected time and cost *before* transcribing, and the actual figures after
 - Fix ASR errors from a persistent word system in a single pass, with every change highlighted
@@ -72,6 +76,7 @@ OPENAI_API_KEY=your_openai_api_key
 
 # Optional when running backend outside docker:
 # DATABASE_URL=postgresql://user:password@localhost:6879/borntodev_db
+# AUTO_TRIM_URL=http://localhost:8082
 ```
 
 ## Run with Docker (Recommended)
@@ -138,6 +143,14 @@ Base URL: `http://localhost:8734`
 - `POST /api/videos/{video_id}/frames` - extract frames for a video
 - `GET /api/videos/{video_id}/frames` - list extracted frames
 - `GET /api/videos/{video_id}/frames/{frame_filename}` - fetch an extracted frame
+- `GET /api/auto-trim/capabilities` - the CPU, the GPU devices in the trim service's container, and every encoder it tried
+- `GET /api/videos/{video_id}/auto-trim/estimate?kept_ratio=` - how long a trim would take (instant)
+- `POST /api/videos/{video_id}/auto-trim/preview` - start an analyze-only job: what would be cut
+- `POST /api/videos/{video_id}/auto-trim` - start the render of the video without its silent parts
+- `GET /api/videos/{video_id}/auto-trim/job` - phase, progress and ETA of that job
+- `DELETE /api/videos/{video_id}/auto-trim/job` - cancel it, killing the encodes
+- `GET /api/videos/{video_id}/trimmed?download=1` - stream or download the trimmed render
+- `DELETE /api/videos/{video_id}/trimmed` - discard the trimmed render
 - `GET /api/transcribe-models` - transcription models the UI can offer, with per-minute cost
 - `GET /api/videos/{video_id}/transcribe-estimate?model=<id>` - projected time and cost, before running
 - `POST /api/videos/{video_id}/transcribe` - generate transcript + caption segments (optional body: `{"model": "<id>", "polish": true}`)
@@ -191,6 +204,261 @@ The `gpt-*transcribe` models reject `response_format=verbose_json` and return te
 no timings at all. For those, `pipeline._silence_cue_bounds()` cuts the audio into
 2-12s windows in the middle of pauses found by ffmpeg `silencedetect`, transcribes each
 window separately, and takes the cue timing from the cut points.
+
+## Auto Trim
+
+**ตัดช่วงเงียบอัตโนมัติ** on the video page cuts the silent parts out of a video and
+renders what is left as a new file. The upload is never modified: the result is a
+separate render you can play, download, re-run with other settings, or throw away.
+
+Videos up to **three hours** are accepted (`MAX_DURATION_SECONDS`), with no limit on
+file size — a 980 MB source is nothing unusual and nothing in the path loads a whole
+track or picture into memory.
+
+### Three buttons and a bar
+
+- **วิเคราะห์** (`POST /api/videos/{id}/auto-trim/preview`) starts an analyze-only
+  job: what would be cut, without the encode time.
+- **ตัดอัตโนมัติ** (`POST /api/videos/{id}/auto-trim`) starts the render.
+- **ยกเลิก** (`DELETE /api/videos/{id}/auto-trim/job`) stops a running job and kills
+  the ffmpeg processes it has going.
+
+Both start calls return straight away with a job id, and the UI polls
+`GET /api/videos/{id}/auto-trim/job` for phase, progress and ETA — a three-hour
+video takes minutes, which is far too long to hold a request open for. The id is
+kept on the video row, so closing the tab does not lose the render: the next poll,
+from any worker, files the result.
+
+The bar's pace is weighted by each phase's *expected* time rather than its frames,
+so it moves evenly instead of crawling through the encode, and the render phase
+tracks whichever of picture and audio is **behind** — they run at once, and the
+phase is only over when the slower one lands. The ETA comes from the up-front
+estimate until about 5% is done, then from the measured pace.
+
+`GET /api/videos/{id}/auto-trim/estimate` answers instantly (ffprobe only) with how
+long a trim should take. Without `kept_ratio` it assumes the whole video survives,
+which makes it an upper bound; the UI passes the share a preview measured to sharpen
+it. The rates behind it (audio analysis, pixels per second, audio encoding)
+calibrate themselves from every run, so the numbers fit the machine rather than a
+guess baked into the code.
+
+### The edit decision is auto-editor's
+
+The decision of *which frames to keep* is a port of [auto-editor](https://auto-editor.com)
+(`--edit audio`), not a reimplementation of the idea:
+
+1. The timeline runs at the source's frame rate, rounded to two decimals, with the
+   NTSC rates restored to their exact rationals (`makeSaneTimebase`).
+2. Audio is decoded to interleaved s16 at its own sample rate, and each timeline
+   frame gets one level: the loudest sample in that frame's slice, as a fraction of
+   full scale. Frame sizes are `sample_rate / timebase` with the rounding error
+   carried forward, so the slices stay aligned to the clock over a long file
+   (`src/analyze/audio.nim`).
+3. Levels and the threshold are compared as 16-bit fixed point, the way auto-editor
+   stores them (`Unorm16`), so a borderline frame lands on the same side in both.
+4. Every active run is grown by the margin at each end (`mutMargin`), then short
+   runs are smoothed away (`smoothing`): silences shorter than `mincut` are filled,
+   clips shorter than `minclip` are dropped, repeatedly until the mask stops
+   changing.
+5. Each run of kept frames becomes one clip, back to back, with no speed change.
+
+Steps 4 and 5 live in [`auto-trim-rs/src/mask.rs`](auto-trim-rs/src/mask.rs) with
+unit tests that pin the quirks (a leading active run has no transition for the start
+margin to grow from; the final run is measured inclusively; the all-flip 2-cycle
+exits on the input).
+
+Analysis is deterministic, so its levels are cached per (file, timebase, stream).
+Re-running a preview at a different threshold skips it entirely: measured 57.9s to
+0.05s on a three-hour file.
+
+### Settings
+
+| Setting | Default | auto-editor equivalent |
+|---|---|---|
+| ความดังขั้นต่ำ (`threshold`) | 4% | `--edit audio:threshold=0.04` |
+| เผื่อหัวท้าย (`margin_start`, `margin_end`) | 0.2s | `--margin 0.2s` |
+| `mincut` | 0.2s | `--smooth 0.2s,0.1s` |
+| `minclip` | 0.1s | `--smooth 0.2s,0.1s` |
+| `crf`, `preset` | 20, `veryfast` | encoder only, not part of the decision |
+
+`mincut`/`minclip` and the encoder knobs are API-only; the UI exposes the two
+settings worth touching per video. Raise the threshold to cut more aggressively,
+raise the margin if the cuts feel abrupt.
+
+### How the render works
+
+The picture is encoded in **chunks that run in parallel**, each ffmpeg decoding only
+its own span of the source and filtering it down to the surviving frames with
+`select`, then rebuilding the timestamps with `setpts` at the timeline's timebase.
+The chunks are joined with a stream copy and muxed with the audio.
+
+Chunk planning balances kept footage across the encode slots, but also:
+
+- caps the segments per chunk (`MAX_SEGMENTS_PER_CHUNK`, 64), because a `select`
+  expression is evaluated for every frame;
+- keeps chunks at least `MIN_CHUNK_SECONDS` (20s) of kept footage, since each one
+  pays for its own seek and decode lead-in;
+- breaks before a gap longer than `MAX_GAP_SECONDS` (10s), because a chunk decodes
+  its whole span, cut-away parts included.
+
+The `select` terms are summed as a **balanced tree**, not a flat `a+b+c+…` chain.
+FFmpeg's expression parser descends recursively with a fixed budget of 100 levels,
+and a flat chain spends it in proportion to the number of terms: about 135 cuts is
+enough to fail the parse outright with "Cannot allocate memory". A tree needs only
+log2(n) levels. (Verified directly: 139 terms flat fails, 139 and even 2000 as a
+tree parse fine.)
+
+Audio is **not** cut by ffmpeg. `aselect` can only cut on packet boundaries (~21ms
+at 48kHz), and rounding every cut to a packet would drift out of sync with the
+picture a little on every one of them — seconds of drift across the hundreds of cuts
+a long video produces. Instead the service splices the samples itself, on the exact
+frame boundaries the analysis used, and streams them into one encoder (so there is a
+single encoder priming block and no drift at the joins). Decoding, splicing and
+encoding run on separate threads, and progress comes from the encoder's own report
+rather than from what has been fed to it.
+
+Every render is checked against the edit: the frames ffmpeg reports across all
+chunks must match the frames the mask keeps, or the job fails rather than writing a
+file that quietly dropped content.
+
+### Measured
+
+On a 16-core machine with no GPU passed into the container:
+
+| Source | Analyze | Render | Total |
+|---|---|---|---|
+| 42s, 720p, 4 segments | 0.2s | 1.8s | 2.0s |
+| 20 min, 320x240, 120 segments | 1.7s (0.05s cached) | 14.6s | 16.3s |
+| 10 min, 1080p, 980 MB, 66 segments | 2.2s | 115.1s | 117.3s |
+| 3 h, 320x240, 1080 segments | 12-58s (0.05s cached) | — | — |
+
+Frame counts came back exact in every case. The 1080p figure is a worst case for the
+encoder: the test source is pure noise, which is far harder to compress than real
+footage.
+
+### CPU and GPU detection
+
+At startup the service works out what the machine can encode with, and uses a GPU
+whenever one is usable. Nothing is taken on trust: ffmpeg being *built* with
+`h264_nvenc` says nothing about whether the container can reach a GPU — the Debian
+build advertises NVENC, QSV and VAAPI on a laptop with no `/dev/dri` at all. So each
+candidate is tried against a real clip, **through the same filter chain a render
+uses**, and only one that produces frames is chosen.
+
+Each family is tried in two shapes, fastest first:
+
+1. **GPU decode + GPU encode** — `-hwaccel cuda|qsv|vaapi` with
+   `-hwaccel_output_format`, so frames never leave the device. `select` and `setpts`
+   only pass frames along without touching pixels, which is what makes a full-GPU
+   pipeline possible at all.
+2. **CPU decode + GPU encode** — the encoder uploads (VAAPI gets an explicit
+   `format=nv12,hwupload` on the end of the chain).
+
+Order: NVENC, Quick Sync, VAAPI, then `libx264`. `VIDEO_CODEC` forces one (still
+tested, still falling back if it cannot run). The chosen encoder also seeds the time
+estimate, so the first estimate on a GPU box is not a CPU-shaped guess.
+
+`GET /api/auto-trim/capabilities` reports the whole finding — and the trim panel
+shows a **CPU/GPU badge** with the encoder in use:
+
+```json
+{
+  "cpu_model": "AMD Ryzen 7 8840U w/ Radeon 780M Graphics",
+  "cpu_cores": 16,
+  "devices": [],
+  "built_with": ["h264_nvenc", "h264_qsv", "h264_vaapi", "..."],
+  "chosen": "libx264",
+  "hardware": false,
+  "pipeline": "cpu decode + cpu encode",
+  "attempts": [
+    {"encoder": "h264_nvenc", "pipeline": "gpu decode + gpu encode (nvenc)",
+     "ok": false, "detail": "Device setup failed for decoder ... Operation not permitted"}
+  ]
+}
+```
+
+`devices: []` with a GPU in `cpu_model` is the usual story: the machine has one, the
+container cannot see it.
+
+### Giving the container a GPU
+
+A hardware encoder is the cheapest large speed-up available (5-15x on the render),
+and the render is the whole cost of a trim. It needs the device passed in:
+
+```bash
+# Intel or AMD graphics (VAAPI / Quick Sync)
+docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d
+
+# NVIDIA (needs the NVIDIA Container Toolkit on the host)
+docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+```
+
+Then check it took:
+
+```bash
+curl -s localhost:8734/api/auto-trim/capabilities -H "Authorization: Bearer $TOKEN"
+```
+
+Docker Desktop on Windows and macOS cannot pass a GPU through for VAAPI/QSV, so a
+dev machine there stays on `libx264` — which is exactly what the report will say,
+rather than failing halfway through a render.
+
+### Not (yet) smart render
+
+auto-editor can copy whole GOPs and re-encode only the partial ones at each edit
+boundary ([`src/render/smart.nim`](auto-editor/src/render/smart.nim)), which would
+cut the encode by 2-8x depending on the source's keyframe interval, with no quality
+loss on the copied parts. It is not here yet because it cannot be assembled through
+the ffmpeg CLI — four approaches were measured on a 360-frame edit:
+
+| Assembly | Frames (want 360) | Copied spans |
+|---|---|---|
+| concat demuxer + `inpoint`/`outpoint` | 364 | misplaced |
+| TS pieces + `-to` | 364 | misplaced |
+| TS pieces + `-frames:v` | 360 | one span lost its first frame to a DTS collision |
+| raw Annex B + `cat` | 360 packets, 358 decoded | **bit-identical and correctly placed** |
+
+The pieces themselves work — copied GOPs come out bit-identical, and mixed SPS/PPS
+is fine in band — but the timestamps at each join have to be written per packet,
+which is why auto-editor links libav instead of shelling out. Doing it here means
+the same: `ffmpeg-next` plus a packet-level assembler.
+
+### Service
+
+`auto-trim-rs` is a Rust (axum) service in the compose stack, same shape as
+`frame-extractor-rs`: it shares the `videos_data` volume and the backend reaches it
+over `AUTO_TRIM_URL`. There is deliberately no Python fallback — a second
+implementation of the edit decision would drift from this one, and a video trimmed
+differently depending on deployment is worse than a clear error.
+
+| Env var | Where | Default | Meaning |
+|---|---|---|---|
+| `AUTO_TRIM_URL` | backend | set by compose | `http://auto-trim:8082`; unset makes the endpoints answer 503 |
+| `AUTO_TRIM_TIMEOUT` | backend | 120 | seconds to wait on a call (all of them are quick now) |
+| `MAX_DURATION_SECONDS` | auto-trim | 10800 | longest video accepted |
+| `MAX_ACTIVE_JOBS` | auto-trim | 4 | jobs allowed to run at once (a 5th gets a 429) |
+| `ENCODE_WORKERS` | auto-trim | cores ÷ threads-per-chunk | parallel chunk encodes, shared by every job |
+| `THREADS_PER_CHUNK` | auto-trim | 2 | threads per chunk encode |
+| `MAX_SEGMENTS_PER_CHUNK` | auto-trim | 64 | bounds the per-frame filter cost |
+| `MIN_CHUNK_SECONDS` | auto-trim | 20 | smallest worthwhile chunk |
+| `MAX_GAP_SECONDS` | auto-trim | 10 | gap that breaks a chunk |
+| `VIDEO_CODEC` | auto-trim | detected | force an encoder (`libx264`, `h264_nvenc`, `h264_qsv`, `h264_vaapi`) |
+| `VAAPI_DEVICE` | auto-trim | `/dev/dri/renderD128` | which render node VAAPI uses |
+| `PRESET`, `CRF` | auto-trim | `veryfast`, 20 | quality, translated per encoder family (`-cq` for NVENC, `-global_quality` for QSV, `-qp` for VAAPI) |
+| `AAC_CODER` | auto-trim | `fast` | ffmpeg's default (`twoloop`) is half the speed at the same bitrate |
+| `LEVEL_CACHE`, `LEVEL_CACHE_MB` | auto-trim | on, 2048 | analysis cache and its size cap |
+| `JOB_RETENTION_SECONDS` | auto-trim | 7200 | how long a finished job stays pollable |
+| `WORK_DIR` | auto-trim | `/tmp/auto-trim` | scratch space and the level cache |
+
+Errors keep their meaning: a file with no audio track answers 400, one over the
+length limit answers 400 with its length, an edit that would keep nothing answers
+422, too many jobs answers 429 — and a failed or cancelled run leaves any previous
+render untouched.
+
+### Not included
+
+Captions are not re-timed against the cut. The trimmed render and the transcript of
+the original no longer line up, so transcribe *after* trimming if you need both.
 
 ## Caption Clean-up
 
@@ -272,16 +540,19 @@ python pipeline.py video.mp4 --no-polish
 ## Typical Workflow
 
 1. Upload a video from the homepage.
-2. Open the video page and pick a transcription model — the projected time and cost appear
+2. To cut the dead air out first, run **วิเคราะห์** to see how much would go, then
+   **ตัดอัตโนมัติ**. Transcribe after trimming, not before: captions are not re-timed
+   against the cut.
+3. Open the video page and pick a transcription model — the projected time and cost appear
    beneath the button.
-3. Trigger transcription. The word system, line splitting and timing repair run
+4. Trigger transcription. The word system, line splitting and timing repair run
    automatically; the actual time and cost appear when it finishes.
-4. Open the report panel to see every word that was corrected, grouped by rule.
-5. Preview the synced caption list, or toggle native subtitles on the player.
-6. Click the pencil (or double-click a cue) to hand-fix any remaining line. If the same
+5. Open the report panel to see every word that was corrected, grouped by rule.
+6. Preview the synced caption list, or toggle native subtitles on the player.
+7. Click the pencil (or double-click a cue) to hand-fix any remaining line. If the same
    wrong word appears in several places, hit Ctrl+F and replace it everywhere at once —
    leave **บันทึกคู่คำเข้าระบบคำ** checked and the next transcript fixes it by itself.
-7. Extract frames as needed.
+8. Extract frames as needed.
 
 ## Troubleshooting
 
