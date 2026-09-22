@@ -458,6 +458,7 @@ pub struct SyncResult {
     /// How many standard deviations the peak stands above the rest of the curve.
     /// This is what separates a real match from a rolling baseline.
     pub clearance: f64,
+
     /// Seconds the two recordings share once aligned.
     pub overlap_seconds: f64,
     /// Whether this is good enough to stack the two without checking by ear.
@@ -609,18 +610,31 @@ pub struct Drift {
     pub windows: Vec<Refinement>,
 }
 
+/// JSON has no infinity: serde writes one as `null`, which reaches a browser as a
+/// missing number rather than a large one. A quantity with no bound is reported as
+/// absent on purpose instead of as a value that turns into nothing in transit.
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncReport {
     /// How many standard deviations the correlation peak stood above the rest.
-    pub clearance: f64,
+    /// Absent when nothing was measured, which is the case for an offset that was
+    /// handed to us.
+    pub clearance: Option<f64>,
     /// Where the second recording's start sits on the first one's clock. Negative
     /// means it was already rolling. A time `t` on the first is `t - offset` on
     /// the second.
     pub offset_seconds: f64,
     pub confidence: f64,
-    pub peak_ratio: f64,
+    pub peak_ratio: Option<f64>,
     pub overlap_seconds: f64,
     pub reliable: bool,
+    /// Whether this was measured or handed to us. A supplied offset is taken as
+    /// read — someone who typed it in has decided they trust it — but it carries
+    /// none of the evidence a measurement does, and must not be mistaken for one.
+    pub supplied: bool,
     /// The whole-file answer, before any refinement, for comparison.
     pub coarse_offset_seconds: f64,
     pub coarse_hz: f64,
@@ -640,8 +654,9 @@ impl SyncReport {
         let mut report = SyncReport {
             offset_seconds,
             confidence: 1.0,
-            peak_ratio: f64::INFINITY,
-            clearance: f64::INFINITY,
+            peak_ratio: None,
+            clearance: None,
+            supplied: true,
             overlap_seconds: 0.0,
             reliable: true,
             coarse_offset_seconds: offset_seconds,
@@ -765,8 +780,9 @@ pub fn measure(
     let mut report = SyncReport {
         offset_seconds: coarse.offset_seconds,
         confidence: coarse.confidence,
-        peak_ratio: coarse.peak_ratio,
-        clearance: coarse.clearance,
+        peak_ratio: finite(coarse.peak_ratio),
+        clearance: finite(coarse.clearance),
+        supplied: false,
         overlap_seconds: coarse.overlap_seconds,
         reliable: coarse.reliable,
         coarse_offset_seconds: coarse.offset_seconds,
@@ -1264,6 +1280,28 @@ mod tests {
     }
 
     #[test]
+    fn an_offset_given_by_hand_claims_no_evidence() {
+        // Infinity here used to mean "nothing to beat", which JSON turns into
+        // null on the way out — a missing number the far end then reads as a
+        // number that is there. Absent on purpose, and marked as supplied.
+        let report = SyncReport::supplied(2.5, 100.0, 90.0);
+        assert!(report.clearance.is_none() && report.peak_ratio.is_none());
+        assert!(report.supplied && report.reliable);
+        assert!((report.overlap_seconds - 90.0).abs() < 1e-9);
+
+        let json = serde_json::to_string(&report).expect("serialises");
+        assert!(json.contains("\"supplied\":true"), "{json}");
+        assert!(json.contains("\"clearance\":null"), "{json}");
+        // Every number that survives the trip is a real one.
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parses");
+        for (key, value) in parsed.as_object().expect("an object") {
+            if let Some(number) = value.as_f64() {
+                assert!(number.is_finite(), "{key} is {number}");
+            }
+        }
+    }
+
+    #[test]
     fn a_clock_without_drift_shifts_every_moment_the_same() {
         let clock = Clock { offset_seconds: 2.5, slope: 0.0 };
         // b started 2.5s after a, so a-time 10 is b-time 7.5.
@@ -1285,8 +1323,9 @@ mod tests {
         let base = SyncReport {
             offset_seconds: 1.0,
             confidence: 0.9,
-            peak_ratio: 3.0,
-            clearance: 25.0,
+            peak_ratio: Some(3.0),
+            clearance: Some(25.0),
+            supplied: false,
             overlap_seconds: 600.0,
             reliable: true,
             coarse_offset_seconds: 1.0,
@@ -1324,8 +1363,9 @@ mod tests {
         let report = SyncReport {
             offset_seconds: 5.0,
             confidence: 0.9,
-            peak_ratio: 3.0,
-            clearance: 25.0,
+            peak_ratio: Some(3.0),
+            clearance: Some(25.0),
+            supplied: false,
             overlap_seconds: 0.0,
             reliable: true,
             coarse_offset_seconds: 5.0,

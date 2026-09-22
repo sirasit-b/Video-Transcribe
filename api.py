@@ -1063,6 +1063,16 @@ def _remember_pair(
     the second one's copy is negated. Either page can then say where the other sits
     without having to know which of them was measured against which.
     """
+    if report.get("supplied") and (video.sync_result or second.sync_result):
+        # A trim run against an offset that was typed in, or passed back from an
+        # earlier measurement, reports that offset and nothing else. Storing it
+        # would throw away the measurement it came from — the confidence, the
+        # drift, the windows — and replace it with a number that cannot be judged.
+        video.pair_video_id = second.id
+        second.pair_video_id = video.id
+        db.commit()
+        return
+
     video.pair_video_id = second.id
     video.sync_result = report
     second.pair_video_id = video.id
