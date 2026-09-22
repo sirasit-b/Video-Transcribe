@@ -160,3 +160,156 @@ def test_a_long_edit_writes_every_clip():
     clips = root.findall("./library/event/project/sequence/spine/asset-clip")
     assert len(clips) == 1500
     assert seconds(clips[-1].attrib["offset"]) == Fraction(1499 * 40, 30)
+
+
+# ---------------------------------------------------------------------------
+# Final Cut Pro 7 interchange XML (what Premiere, Resolve and FCP 7 read)
+# ---------------------------------------------------------------------------
+
+
+def build_xml(**overrides) -> str:
+    kwargs = dict(
+        original_name="lecture 01.mp4",
+        segments=SEGMENTS,
+        timebase_num=30,
+        timebase_den=1,
+        width=1280,
+        height=720,
+        source_duration=42.4533,
+        sample_rate=48000,
+        channels=2,
+    )
+    kwargs.update(overrides)
+    return fcpxml.build_xmeml(**kwargs)
+
+
+def test_xmeml_parses_and_counts_frames_not_seconds():
+    root = ET.fromstring(build_xml())
+    assert root.tag == "xmeml"
+    sequence = root.find("./sequence")
+    kept = sum(s["end_frame"] - s["start_frame"] for s in SEGMENTS)
+    assert sequence.findtext("duration") == str(kept)
+    assert sequence.findtext("./rate/timebase") == "30"
+    assert sequence.findtext("./rate/ntsc") == "FALSE"
+
+
+def test_xmeml_clips_carry_timeline_and_source_positions():
+    root = ET.fromstring(build_xml())
+    clips = root.findall("./sequence/media/video/track/clipitem")
+    assert len(clips) == len(SEGMENTS)
+
+    expected_start = 0
+    for clip, segment in zip(clips, SEGMENTS):
+        frames = segment["end_frame"] - segment["start_frame"]
+        # start/end place it on the timeline; in/out say where it came from.
+        assert clip.findtext("start") == str(expected_start)
+        assert clip.findtext("end") == str(expected_start + frames)
+        assert clip.findtext("in") == str(segment["start_frame"])
+        assert clip.findtext("out") == str(segment["end_frame"])
+        expected_start += frames
+
+
+def test_xmeml_writes_ntsc_as_a_flag_on_a_whole_timebase():
+    # 29.97 is "timebase 30 with the NTSC flag", not 29.97.
+    root = ET.fromstring(build_xml(timebase_num=30000, timebase_den=1001))
+    assert root.findtext("./sequence/rate/timebase") == "30"
+    assert root.findtext("./sequence/rate/ntsc") == "TRUE"
+
+    film = ET.fromstring(build_xml(timebase_num=24000, timebase_den=1001))
+    assert film.findtext("./sequence/rate/timebase") == "24"
+    assert film.findtext("./sequence/rate/ntsc") == "TRUE"
+
+    # Frame numbers are unaffected: they are frame numbers.
+    clip = root.find("./sequence/media/video/track/clipitem")
+    assert clip.findtext("out") == "24"
+
+
+def test_xmeml_defines_the_file_once_and_references_it_after():
+    root = ET.fromstring(build_xml())
+    files = root.findall(".//file")
+    # One per clip on every track, but only the first carries the definition.
+    assert len(files) > 1
+    defined = [f for f in files if f.find("pathurl") is not None]
+    assert len(defined) == 1
+    assert defined[0].attrib["id"] == "file-1"
+    assert all(f.attrib["id"] == "file-1" for f in files)
+    assert defined[0].findtext("pathurl") == "file:///lecture%2001.mp4"
+
+
+def test_xmeml_links_every_clip_to_its_own_audio():
+    root = ET.fromstring(build_xml())
+    video_clips = root.findall("./sequence/media/video/track/clipitem")
+    audio_tracks = root.findall("./sequence/media/audio/track")
+    # A stereo source explodes into one track per channel, as Premiere expects.
+    assert len(audio_tracks) == 2
+    for track in audio_tracks:
+        assert len(track.findall("clipitem")) == len(SEGMENTS)
+
+    every_id = {clip.attrib["id"] for clip in root.findall(".//clipitem")}
+    assert len(every_id) == len(SEGMENTS) * 3, "ids must be unique across tracks"
+
+    # Each link names a clip that exists, so the editor can group them.
+    for clip in video_clips:
+        refs = [link.findtext("linkclipref") for link in clip.findall("link")]
+        assert clip.attrib["id"] in refs
+        assert len(refs) == 3
+        assert all(ref in every_id for ref in refs)
+
+
+def test_xmeml_mono_source_gets_one_audio_track():
+    root = ET.fromstring(build_xml(channels=1))
+    tracks = root.findall("./sequence/media/audio/track")
+    assert len(tracks) == 1
+    assert tracks[0].attrib["premiereTrackType"] == "Mono"
+    assert root.findtext("./sequence/media/audio/numOutputChannels") == "1"
+
+
+def test_xmeml_audio_clips_point_at_the_audio_of_the_source():
+    root = ET.fromstring(build_xml())
+    clip = root.find("./sequence/media/audio/track/clipitem")
+    assert clip.findtext("./sourcetrack/mediatype") == "audio"
+    assert clip.findtext("./sourcetrack/trackindex") == "1"
+
+
+def test_xmeml_escapes_a_thai_name():
+    root = ET.fromstring(build_xml(original_name="บทเรียน & เสียง.mp4"))
+    assert root.findtext("./sequence/name") == "บทเรียน & เสียง"
+    assert root.findtext(".//file/pathurl").startswith("file:///%E0%B8%9A")
+
+
+def test_xmeml_skips_degenerate_segments():
+    root = ET.fromstring(
+        build_xml(segments=[{"start_frame": 5, "end_frame": 5}, {"start_frame": 9, "end_frame": 19}])
+    )
+    clips = root.findall("./sequence/media/video/track/clipitem")
+    assert len(clips) == 1
+    assert clips[0].findtext("start") == "0"
+    assert clips[0].findtext("end") == "10"
+
+
+def test_xmeml_audio_only_source_has_no_video_definition():
+    root = ET.fromstring(build_xml(has_video=False))
+    defined = [f for f in root.findall(".//file") if f.find("pathurl") is not None][0]
+    assert defined.find("./media/video") is None
+    assert defined.find("./media/audio") is not None
+
+
+def test_both_formats_describe_the_same_edit():
+    kept = sum(s["end_frame"] - s["start_frame"] for s in SEGMENTS)
+    xmeml = ET.fromstring(build_xml())
+    fcp = ET.fromstring(build())
+
+    assert xmeml.findtext("./sequence/duration") == str(kept)
+    total = sum(
+        seconds(c.attrib["duration"])
+        for c in fcp.findall("./library/event/project/sequence/spine/asset-clip")
+    )
+    assert total == Fraction(kept, 30)
+
+    # Same source positions, one counted in frames and one in seconds.
+    xml_ins = [int(c.findtext("in")) for c in xmeml.findall("./sequence/media/video/track/clipitem")]
+    fcp_starts = [
+        seconds(c.attrib["start"]) * 30
+        for c in fcp.findall("./library/event/project/sequence/spine/asset-clip")
+    ]
+    assert xml_ins == [int(s) for s in fcp_starts]

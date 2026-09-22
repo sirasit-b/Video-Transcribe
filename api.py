@@ -1194,26 +1194,14 @@ def cancel_auto_trim_job(
     db.commit()
     return status
 
-@app.get("/api/videos/{video_id}/auto-trim/fcpxml")
-def export_auto_trim_fcpxml(
-    video_id: int,
-    media_path: Optional[str] = Query(
-        None,
-        description="Folder the original footage lives in on the editing machine, "
-        "so Final Cut does not have to ask where it went",
-    ),
-    version: str = Query("11", pattern="^(10|11)$"),
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
-):
-    """The last trim as a Final Cut Pro XML project.
+# An editor export needs the source's shape as well as the cut list, so both
+# endpoints read the same fields out of what the render recorded.
+_MEDIA_PATH_HELP = (
+    "Folder the original footage lives in on the editing machine, so the editor "
+    "does not have to ask where it went"
+)
 
-    The XML references the *original* upload rather than the trimmed render, so the
-    cuts arrive in Final Cut already made but still adjustable — which is the point
-    of taking an edit into an editor. Each kept range becomes one clip on the spine,
-    carrying the source's picture and audio together.
-    """
-    video = _get_owned_video(video_id, db, current_user)
+def _edit_for_export(video: models.Video) -> dict:
     result = video.trim_result or {}
     segments = video.trim_segments or []
     if not segments:
@@ -1223,20 +1211,40 @@ def export_auto_trim_fcpxml(
         )
 
     timebase = result.get("timebase") or {}
+    return {
+        "original_name": video.original_name,
+        "segments": segments,
+        "timebase_num": int(timebase.get("num") or 30),
+        "timebase_den": int(timebase.get("den") or 1),
+        "width": int(result.get("width") or 1920),
+        "height": int(result.get("height") or 1080),
+        "source_duration": float(result.get("source_duration") or 0.0),
+        "sample_rate": int(result.get("sample_rate") or 48000),
+        "channels": int(result.get("channels") or 2),
+        "has_video": bool(result.get("has_video", True)),
+    }
+
+@app.get("/api/videos/{video_id}/auto-trim/fcpxml")
+def export_auto_trim_fcpxml(
+    video_id: int,
+    media_path: Optional[str] = Query(None, description=_MEDIA_PATH_HELP),
+    version: str = Query("11", pattern="^(10|11)$"),
+    db: Session = Depends(get_db),
+    # A link, not an XHR: the token arrives as a query param because an
+    # <a href> cannot set an Authorization header.
+    current_user: models.User = Depends(auth.get_current_user_for_media),
+):
+    """The last trim as an FCPXML project, for Final Cut Pro 10.6.8 and later.
+
+    The XML references the *original* upload rather than the trimmed render, so the
+    cuts arrive already made but still adjustable — which is the point of taking an
+    edit into an editor. Each kept range becomes one clip on the spine, carrying
+    the source's picture and audio together.
+    """
+    video = _get_owned_video(video_id, db, current_user)
     try:
         document = fcpxml.build_fcpxml(
-            original_name=video.original_name,
-            segments=segments,
-            timebase_num=int(timebase.get("num") or 30),
-            timebase_den=int(timebase.get("den") or 1),
-            width=int(result.get("width") or 1920),
-            height=int(result.get("height") or 1080),
-            source_duration=float(result.get("source_duration") or 0.0),
-            sample_rate=int(result.get("sample_rate") or 48000),
-            channels=int(result.get("channels") or 2),
-            has_video=bool(result.get("has_video", True)),
-            version=version,
-            media_path=media_path,
+            **_edit_for_export(video), version=version, media_path=media_path
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1246,6 +1254,34 @@ def export_auto_trim_fcpxml(
         content=document,
         media_type="application/xml",
         headers=_attachment_headers(f"{base}_trimmed.fcpxml"),
+    )
+
+@app.get("/api/videos/{video_id}/auto-trim/xml")
+def export_auto_trim_xml(
+    video_id: int,
+    media_path: Optional[str] = Query(None, description=_MEDIA_PATH_HELP),
+    db: Session = Depends(get_db),
+    # A link, not an XHR: the token arrives as a query param because an
+    # <a href> cannot set an Authorization header.
+    current_user: models.User = Depends(auth.get_current_user_for_media),
+):
+    """The last trim as Final Cut Pro 7 interchange XML.
+
+    The older format, and the one that travels: Premiere Pro, DaVinci Resolve and
+    Final Cut Pro 7 all read it. Same edit as the FCPXML export, counted in frames
+    on a whole timebase with an NTSC flag instead of in rationals.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    try:
+        document = fcpxml.build_xmeml(**_edit_for_export(video), media_path=media_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    base = Path(video.original_name).stem or f"video_{video_id}"
+    return Response(
+        content=document,
+        media_type="application/xml",
+        headers=_attachment_headers(f"{base}_trimmed.xml"),
     )
 
 @app.get("/api/videos/{video_id}/trimmed")

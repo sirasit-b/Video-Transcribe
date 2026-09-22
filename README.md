@@ -21,7 +21,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 |-- pipeline.py             # Audio extraction, transcription, SRT/VTT captions, frame extraction adapter
 |-- glossary.py             # The word system: ASR error rules + one-pass corrector
 |-- caption_polish.py       # Line splitting, spacing repair, timestamp sanitising
-|-- fcpxml.py               # Final Cut Pro XML for an auto-trimmed edit
+|-- fcpxml.py               # Editor projects for an auto-trimmed edit (FCPXML and FCP7 XML)
 |-- pricing.py              # Per-run time and cost estimates
 |-- docker-compose.yml      # Multi-service local stack
 |-- docker-compose.vaapi.yml   # Overlay: pass an Intel/AMD GPU to the trim service
@@ -40,8 +40,9 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Stream uploaded videos
 - Extract evenly spaced frames from videos
 - Cut the silent parts out of a video with one button, using auto-editor's edit decision
-- See the loudness envelope before and after the cut, and export the edit as a
-  Final Cut Pro project (FCPXML) that still points at the original footage
+- See the loudness envelope before and after the cut, and export the edit as an
+  editor project — FCPXML or Final Cut Pro 7 XML (Premiere, Resolve) — still
+  pointing at the original footage
 - Transcribe video audio to Thai text with per-segment timestamps, choosing the model per run
 - See the projected time and cost *before* transcribing, and the actual figures after
 - Fix ASR errors from a persistent word system in a single pass, with every change highlighted
@@ -153,6 +154,7 @@ Base URL: `http://localhost:8734`
 - `GET /api/videos/{video_id}/auto-trim/job` - phase, progress and ETA of that job
 - `DELETE /api/videos/{video_id}/auto-trim/job` - cancel it, killing the encodes
 - `GET /api/videos/{video_id}/auto-trim/fcpxml?media_path=&version=11` - the edit as a Final Cut Pro project
+- `GET /api/videos/{video_id}/auto-trim/xml?media_path=` - the edit as Final Cut Pro 7 XML (Premiere, Resolve)
 - `GET /api/videos/{video_id}/trimmed?download=1` - stream or download the trimmed render
 - `DELETE /api/videos/{video_id}/trimmed` - discard the trimmed render
 - `GET /api/transcribe-models` - transcription models the UI can offer, with per-minute cost
@@ -260,30 +262,41 @@ sends how much of each bucket survives, which is what the red bands are drawn
 from: 1.2 kB whether the edit has four cuts or four thousand, so the picture is
 still there after a reload without keeping a segment list in the row.
 
-### Exporting to Final Cut Pro
+### Exporting the edit to an editor
 
-**FCPXML** next to the video download hands the edit to an editor:
-`GET /api/videos/{id}/auto-trim/fcpxml`.
+Two buttons next to the video download, for the two XMLs editors read:
 
-The XML references the **original** upload, not the trimmed render, so Final Cut
-opens a project whose cuts are already made but still adjustable — which is the
-point of taking an edit into an editor at all. Each kept range becomes one
-`asset-clip` on the spine, carrying the source's picture and audio together.
+| Button | Endpoint | Reads it |
+|---|---|---|
+| **FCPXML** | `/auto-trim/fcpxml` | Final Cut Pro 10.6.8 and later (`?version=10` for a little older) |
+| **XML** | `/auto-trim/xml` | Premiere Pro, DaVinci Resolve, Final Cut Pro 7 |
 
-Times are written as rationals with the timeline's own denominator
-(`{frames × 1001}/30000s` for 29.97), because decimals are what make an imported
-timeline drift off the frame the edit chose.
+Either way the XML references the **original** upload, not the trimmed render, so
+the editor opens a project whose cuts are already made but still adjustable —
+which is the point of taking an edit into an editor at all. Each kept range
+becomes one clip carrying the source's picture and audio together.
 
-Final Cut relinks media it cannot find, so the file imports as-is and asks where
-the footage lives. Filling in the footage folder next to the button (or
-`?media_path=/Volumes/Work/footage`) spares that step. `?version=10` writes FCPXML
-1.10 for older Final Cut versions.
+The two count time differently, and both have a trap:
 
-[`fcpxml.py`](fcpxml.py) is shaped after auto-editor's `src/exports/fcp11.nim`,
-which is the reference for what Final Cut actually accepts, and
-[`test_fcpxml.py`](test_fcpxml.py) covers the parts that fail silently: frame
-rationals, clips sitting end to end, NTSC denominators, Thai filenames as both URL
-and XML.
+- FCPXML uses rationals with the timeline's own denominator
+  (`{frames × 1001}/30000s` for 29.97). Decimals here are what make an imported
+  timeline drift off the frame the edit chose.
+- The Final Cut Pro 7 format counts whole frames on a *rounded* timebase with an
+  NTSC flag — 29.97 is "timebase 30, ntsc TRUE". Frame numbers stay exact; the
+  flag is what tells the editor how long a frame is. A stereo source explodes into
+  one audio track per channel, each clip linked to its picture so they move
+  together, which is what Premiere expects.
+
+Editors relink media they cannot find, so both files import as-is and ask where the
+footage lives. Filling in the footage folder next to the buttons (or
+`?media_path=/Volumes/Work/footage`) spares that step.
+
+[`fcpxml.py`](fcpxml.py) writes both, shaped after auto-editor's
+`src/exports/fcp11.nim` and `src/exports/fcp7.nim` — the reference for what these
+apps actually accept. [`test_fcpxml.py`](test_fcpxml.py) covers the parts that fail
+silently: frame rationals, NTSC flags, clips sitting end to end, one file
+definition referenced by every clip, links that resolve, Thai filenames as both URL
+and XML, and the two documents agreeing on the same edit.
 
 ### The edit decision is auto-editor's
 
@@ -502,7 +515,7 @@ render untouched.
 
 Captions are not re-timed against the cut. The trimmed render and the transcript of
 the original no longer line up, so transcribe *after* trimming if you need both.
-(The FCPXML export has the same boundary: it carries picture and audio, not
+(Both exports have the same boundary: they carry picture and audio, not
 subtitles.)
 
 ## Caption Clean-up

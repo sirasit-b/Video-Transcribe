@@ -2070,11 +2070,25 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                         : ""
                     }`
                   )}
-                  title="โปรเจกต์ Final Cut Pro ที่อ้างถึงไฟล์ต้นฉบับ — รอยตัดมาครบและยังขยับได้"
+                  title="โปรเจกต์ Final Cut Pro (10.6.8+) ที่อ้างถึงไฟล์ต้นฉบับ — รอยตัดมาครบและยังขยับได้"
                   className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
                 >
                   <FileCode className="w-4 h-4" strokeWidth={1.5} />
                   FCPXML
+                </a>
+                <a
+                  href={withAuthToken(
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/xml${
+                      trimMediaPath.trim()
+                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
+                        : ""
+                    }`
+                  )}
+                  title="XML แบบ Final Cut Pro 7 — Premiere Pro, DaVinci Resolve และ FCP 7 อ่านได้"
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <FileCode className="w-4 h-4" strokeWidth={1.5} />
+                  XML
                 </a>
                 <button
                   onClick={handleDeleteTrimmed}
