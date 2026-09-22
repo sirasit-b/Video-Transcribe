@@ -78,6 +78,71 @@ fn max_abs(samples: &[i16]) -> i16 {
     peak
 }
 
+/// Ramp the first and last few milliseconds of a kept range.
+///
+/// A splice lands wherever the edit says, and with a small margin (or none) that
+/// can be in the middle of a waveform — where joining two pieces steps the signal
+/// and clicks. Measured on a deliberately bad edit (no margin, high threshold):
+/// steps of up to 5461 out of 32768 at the joins, a click at every cut. auto-editor
+/// ramps 3ms at every real clip edge for the same reason
+/// (`audioFadeMs`, src/render/audio.nim), and the ramp is short enough to be
+/// inaudible as a fade.
+///
+/// `first_byte` is where this buffer starts in the decoded stream, and
+/// `range_frames` how long the kept range is, both so a buffer that covers only
+/// part of a range still fades the right samples.
+fn apply_edge_fades(
+    buffer: &mut [u8],
+    channels: usize,
+    first_byte: u64,
+    range_start_frame: u64,
+    range_frames: u64,
+    fade_frames: u64,
+) {
+    if fade_frames == 0 || range_frames == 0 || buffer.is_empty() {
+        return;
+    }
+    let frame_bytes = (channels * 2) as u64;
+
+    // Nothing to do for a buffer that sits entirely between the two ramps.
+    let first_frame = first_byte / frame_bytes;
+    let last_frame = (first_byte + buffer.len() as u64 - 1) / frame_bytes;
+    let from_start = first_frame.saturating_sub(range_start_frame);
+    let to_end = (range_start_frame + range_frames).saturating_sub(last_frame + 1);
+    if from_start >= fade_frames && to_end >= fade_frames {
+        return;
+    }
+
+    // Samples are two bytes and the stream is a sequence of them, so a buffer
+    // starting on an odd byte begins mid-sample; that half belongs to the buffer
+    // before this one.
+    let mut offset = (first_byte % 2) as usize;
+    while offset + 2 <= buffer.len() {
+        let absolute = first_byte + offset as u64;
+        let index = (absolute / frame_bytes).saturating_sub(range_start_frame);
+        let tail = range_frames.saturating_sub(index + 1);
+
+        let gain_in = if index < fade_frames {
+            (index as f32 + 0.5) / fade_frames as f32
+        } else {
+            1.0
+        };
+        let gain_out = if tail < fade_frames {
+            (tail as f32 + 0.5) / fade_frames as f32
+        } else {
+            1.0
+        };
+        let gain = gain_in * gain_out;
+
+        if gain < 1.0 {
+            let sample = i16::from_le_bytes([buffer[offset], buffer[offset + 1]]);
+            let scaled = (sample as f32 * gain).round().clamp(-32768.0, 32767.0) as i16;
+            buffer[offset..offset + 2].copy_from_slice(&scaled.to_le_bytes());
+        }
+        offset += 2;
+    }
+}
+
 fn decoder(ffmpeg: &str, path: &Path, ordinal: usize, job: &Job) -> Result<Ffmpeg, String> {
     let mut command = Command::new(ffmpeg);
     command
@@ -238,9 +303,15 @@ pub fn splice_to_encoder(
     codec: &str,
     bitrate: &str,
     coder: &str,
+    fade_ms: f64,
     job: &Job,
 ) -> WorkResult<()> {
     let frame_bytes = (channels * 2) as u64;
+    let fade_frames = if fade_ms > 0.0 {
+        ((fade_ms / 1000.0) * sample_rate as f64).round().max(1.0) as u64
+    } else {
+        0
+    };
 
     let mut decode = decoder(ffmpeg, path, ordinal, job)?;
     let mut stdout = decode.stdout.take().expect("stdout is piped");
@@ -372,8 +443,17 @@ pub fn splice_to_encoder(
                     }
                     let from = (start.max(chunk_start) - chunk_start) as usize;
                     let to = (end.min(chunk_end) - chunk_start) as usize;
+                    let mut piece = read_buffer[from..to].to_vec();
+                    apply_edge_fades(
+                        &mut piece,
+                        channels,
+                        chunk_start + from as u64,
+                        range_start,
+                        range_end - range_start,
+                        fade_frames,
+                    );
                     sender
-                        .send(read_buffer[from..to].to_vec())
+                        .send(piece)
                         .map_err(|_| {
                             WorkError::Failed("the audio encoder stopped reading".to_string())
                         })?;
@@ -480,6 +560,90 @@ mod tests {
             "drifted by {} samples",
             total.abs_diff(expected)
         );
+    }
+
+    /// Read a mono buffer back as samples.
+    fn mono(buffer: &[u8]) -> Vec<i16> {
+        buffer
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    fn filled(frames: usize, value: i16) -> Vec<u8> {
+        value
+            .to_le_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(frames * 2)
+            .collect()
+    }
+
+    #[test]
+    fn a_ramp_opens_and_closes_every_kept_range() {
+        // 10 frames of full scale, ramped over 4 at each end.
+        let mut buffer = filled(10, 1000);
+        apply_edge_fades(&mut buffer, 1, 0, 0, 10, 4);
+        let samples = mono(&buffer);
+
+        // (index + 0.5) / 4 on the way in, the mirror on the way out.
+        assert_eq!(&samples[..4], &[125, 375, 625, 875]);
+        assert_eq!(&samples[4..6], &[1000, 1000]);
+        assert_eq!(&samples[6..], &[875, 625, 375, 125]);
+    }
+
+    #[test]
+    fn the_middle_of_a_long_range_is_left_alone() {
+        // A buffer that starts past the opening ramp and ends before the closing
+        // one must come back untouched — and cheaply.
+        let mut buffer = filled(100, -2000);
+        // Byte 2000 is frame 1000: past the opening ramp, far from the closing one.
+        apply_edge_fades(&mut buffer, 1, 2000, 0, 10_000, 144);
+        assert_eq!(mono(&buffer), vec![-2000; 100]);
+    }
+
+    #[test]
+    fn a_buffer_covering_part_of_a_range_fades_its_own_samples() {
+        // The same range delivered in two buffers has to come out like one.
+        let mut whole = filled(10, 1000);
+        apply_edge_fades(&mut whole, 1, 0, 0, 10, 4);
+
+        let mut first = filled(6, 1000);
+        let mut second = filled(4, 1000);
+        apply_edge_fades(&mut first, 1, 0, 0, 10, 4);
+        apply_edge_fades(&mut second, 1, 12, 0, 10, 4);
+        let mut joined = mono(&first);
+        joined.extend(mono(&second));
+        assert_eq!(joined, mono(&whole));
+    }
+
+    #[test]
+    fn a_ramp_scales_every_channel_of_a_frame() {
+        // Stereo: both samples of a frame share the frame's gain.
+        let mut buffer = filled(4, 800); // 4 samples = 2 stereo frames
+        apply_edge_fades(&mut buffer, 2, 0, 0, 2, 1);
+        let samples = mono(&buffer);
+        assert_eq!(samples[0], samples[1], "left and right share a gain");
+        assert_eq!(samples[2], samples[3]);
+    }
+
+    #[test]
+    fn a_buffer_starting_mid_sample_keeps_that_half_intact() {
+        // A pipe read can split a sample; the half that belongs to the previous
+        // buffer must not be touched.
+        let mut buffer = vec![0x11, 0xE8, 0x03]; // stray byte, then 1000
+        apply_edge_fades(&mut buffer, 1, 1, 0, 10, 4);
+        assert_eq!(buffer[0], 0x11, "the stray half stays as it was");
+        // The whole sample begins at byte 2, which is frame 1: gain (1+0.5)/4.
+        assert_eq!(i16::from_le_bytes([buffer[1], buffer[2]]), 375);
+    }
+
+    #[test]
+    fn no_fade_length_means_no_change() {
+        let mut buffer = filled(8, 5000);
+        apply_edge_fades(&mut buffer, 1, 0, 0, 8, 0);
+        assert_eq!(mono(&buffer), vec![5000; 8]);
     }
 
     #[test]

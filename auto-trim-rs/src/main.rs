@@ -142,6 +142,8 @@ struct JobRequest {
     audio_bitrate: Option<String>,
     #[serde(default)]
     audio_coder: Option<String>,
+    #[serde(default)]
+    audio_fade_ms: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1119,6 +1121,8 @@ fn run_job(
             .audio_coder
             .clone()
             .unwrap_or_else(|| env::var("AAC_CODER").unwrap_or_else(|_| "fast".to_string())),
+        // auto-editor ramps 3ms at every clip edge to keep splices from clicking.
+        audio_fade_ms: request.audio_fade_ms.unwrap_or_else(|| env_f64("AUDIO_FADE_MS", 3.0)),
         threads_per_chunk: state.threads_per_chunk,
     };
 
@@ -1265,6 +1269,7 @@ fn render_all(
                         &options.audio_codec,
                         &options.audio_bitrate,
                         &options.audio_coder,
+                        options.audio_fade_ms,
                         job,
                     )
                     .map(|_| (track_path, phase_started.elapsed().as_secs_f64()))

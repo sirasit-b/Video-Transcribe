@@ -48,6 +48,9 @@ pub struct RenderOptions {
     /// AAC coder: `fast` is twice the speed of ffmpeg's default at the same
     /// bitrate, which matters because audio is the long pole on a long video.
     pub audio_coder: String,
+    /// Milliseconds of ramp at each end of a kept range, so a splice that lands
+    /// mid-waveform does not click. 0 turns it off.
+    pub audio_fade_ms: f64,
     pub threads_per_chunk: usize,
 }
 

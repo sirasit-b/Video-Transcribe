@@ -404,6 +404,13 @@ single encoder priming block and no drift at the joins). Decoding, splicing and
 encoding run on separate threads, and progress comes from the encoder's own report
 rather than from what has been fed to it.
 
+Each kept range gets a **3ms ramp at both ends** (`AUDIO_FADE_MS`), as auto-editor
+does at every clip edge. With the default margin a cut lands in silence and the ramp
+changes nothing audible, but with a small margin or a high threshold it lands
+mid-waveform, where joining two pieces steps the signal and clicks. Measured on a
+deliberately bad edit (no margin, 25% threshold, nine cuts through speech): the step
+across the joins went from 5461 out of 32768 to 30.
+
 Every render is checked against the edit: the frames ffmpeg reports across all
 chunks must match the frames the mask keeps, or the job fails rather than writing a
 file that quietly dropped content.
@@ -533,6 +540,7 @@ differently depending on deployment is worse than a clear error.
 | `VAAPI_DEVICE` | auto-trim | `/dev/dri/renderD128` | which render node VAAPI uses |
 | `PRESET`, `CRF` | auto-trim | `veryfast`, 20 | quality, translated per encoder family (`-cq` for NVENC, `-global_quality` for QSV, `-qp` for VAAPI) |
 | `AAC_CODER` | auto-trim | `fast` | ffmpeg's default (`twoloop`) is half the speed at the same bitrate |
+| `AUDIO_FADE_MS` | auto-trim | 3 | ramp at each end of a kept range, so a splice cannot click; 0 turns it off |
 | `LEVEL_CACHE`, `LEVEL_CACHE_MB` | auto-trim | on, 2048 | analysis cache and its size cap |
 | `JOB_RETENTION_SECONDS` | auto-trim | 7200 | how long a finished job stays pollable |
 | `WORK_DIR` | auto-trim | `/tmp/auto-trim` | scratch space and the level cache |
@@ -541,6 +549,26 @@ Errors keep their meaning: a file with no audio track answers 400, one over the
 length limit answers 400 with its length, an edit that would keep nothing answers
 422, too many jobs answers 429 — and a failed or cancelled run leaves any previous
 render untouched.
+
+### J-cuts and other split edits
+
+A J-cut (audio of the next line starting before its picture) and an L-cut (picture
+holding after the audio has moved on) are *split* edits: the audio and the picture
+cut at different points. On a single continuous take that cannot be done
+automatically without a cost — shifting one track against the other either breaks
+lip sync for the rest of the clip or drops frames of picture that the audio still
+covers. It is an editorial call about *which* shot to hold on, which is why editors
+make it between shots.
+
+What is here instead:
+
+- **Asymmetric margins.** `margin_start` and `margin_end` are separate, so keeping
+  0.3s before speech and 0.1s after gives the breath-before-the-line feel that
+  people usually want from a J-cut, without touching sync.
+- **Real split edits in the editor.** Every export puts each kept range on the
+  timeline as its own clip with its audio linked, which is exactly the material a
+  roll edit works on: unlink, drag the audio edge past the video edge, and that is a
+  J-cut — one drag per cut, in Final Cut, Premiere or Resolve.
 
 ### Not included
 
