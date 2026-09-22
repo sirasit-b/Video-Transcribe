@@ -22,6 +22,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 |-- glossary.py             # The word system: ASR error rules + one-pass corrector
 |-- caption_polish.py       # Line splitting, spacing repair, timestamp sanitising
 |-- fcpxml.py               # Editor projects for an auto-trimmed edit (FCPXML and FCP7 XML)
+|-- timeline_json.py        # auto-editor's own timeline JSON for the same edit
 |-- pricing.py              # Per-run time and cost estimates
 |-- docker-compose.yml      # Multi-service local stack
 |-- docker-compose.vaapi.yml   # Overlay: pass an Intel/AMD GPU to the trim service
@@ -41,8 +42,8 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Extract evenly spaced frames from videos
 - Cut the silent parts out of a video with one button, using auto-editor's edit decision
 - See the loudness envelope before and after the cut, and export the edit as an
-  editor project — FCPXML or Final Cut Pro 7 XML (Premiere, Resolve) — still
-  pointing at the original footage
+  editor project — FCPXML, Final Cut Pro 7 XML (Premiere, Resolve) or auto-editor's
+  own timeline JSON — still pointing at the original footage
 - Transcribe video audio to Thai text with per-segment timestamps, choosing the model per run
 - See the projected time and cost *before* transcribing, and the actual figures after
 - Fix ASR errors from a persistent word system in a single pass, with every change highlighted
@@ -155,6 +156,7 @@ Base URL: `http://localhost:8734`
 - `DELETE /api/videos/{video_id}/auto-trim/job` - cancel it, killing the encodes
 - `GET /api/videos/{video_id}/auto-trim/fcpxml?media_path=&version=11` - the edit as a Final Cut Pro project
 - `GET /api/videos/{video_id}/auto-trim/xml?media_path=` - the edit as Final Cut Pro 7 XML (Premiere, Resolve)
+- `GET /api/videos/{video_id}/auto-trim/json?version=3&media_path=` - the edit as an auto-editor timeline
 - `GET /api/videos/{video_id}/trimmed?download=1` - stream or download the trimmed render
 - `DELETE /api/videos/{video_id}/trimmed` - discard the trimmed render
 - `GET /api/transcribe-models` - transcription models the UI can offer, with per-minute cost
@@ -270,6 +272,7 @@ Two buttons next to the video download, for the two XMLs editors read:
 |---|---|---|
 | **FCPXML** | `/auto-trim/fcpxml` | Final Cut Pro 10.6.8 and later (`?version=10` for a little older) |
 | **XML** | `/auto-trim/xml` | Premiere Pro, DaVinci Resolve, Final Cut Pro 7 |
+| **JSON** | `/auto-trim/json` | auto-editor itself, and anything that wants the cut list as data |
 
 Either way the XML references the **original** upload, not the trimmed render, so
 the editor opens a project whose cuts are already made but still adjustable —
@@ -297,6 +300,34 @@ apps actually accept. [`test_fcpxml.py`](test_fcpxml.py) covers the parts that f
 silently: frame rationals, NTSC flags, clips sitting end to end, one file
 definition referenced by every clip, links that resolve, Thai filenames as both URL
 and XML, and the two documents agreeing on the same edit.
+
+### Exporting the cut list as data
+
+**JSON** writes auto-editor's own timeline ([`timeline_json.py`](timeline_json.py)),
+which goes back where the XMLs cannot: `auto-editor timeline.json -o out.mp4`
+re-renders from it, and a script can read it without parsing XML.
+
+`?version=3` (the default) is the full timeline — resolution, sample rate, layout,
+one clip per kept range on a video layer and an audio layer per stream, exactly what
+`--export json` writes. `?version=1` is the compact cut list: every chunk of the
+timeline in order, kept ones at speed 1 and cut ones at auto-editor's 99999
+("drop this"), so nothing is left implicit. Here `src` is a filesystem path rather
+than a `file://` URL, because that is what auto-editor opens.
+
+### Verified against auto-editor itself
+
+The released auto-editor (29.3.1 from PyPI) was given the same file and asked for
+its own decision, and our exports were handed back to it:
+
+- It **imported both JSON timelines and re-rendered them**: 523 frames each, against
+  the 523 frames our own renderer produced.
+- Feeding *its* per-frame levels through our ported mask reproduces its cut
+  boundaries exactly — `(0,24) (34,146) (147,395) (410,522) (1194,1220)` — so the
+  loudness analysis and the margin agree frame for frame across all 1272 frames.
+- Its own edit keeps 522 frames where ours keeps 523: a single frame, and not a
+  discrepancy. The vendored source tree is 31.6.1, which added the `--smooth`
+  pass (mincut/minclip) that fills a one-frame gap at frame 146; the 29.3.1 release
+  has no `--smooth` at all. Our port follows the tree it was ported from.
 
 ### The edit decision is auto-editor's
 

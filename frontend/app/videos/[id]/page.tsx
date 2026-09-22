@@ -33,6 +33,7 @@ import {
   Scissors,
   Cpu,
   FileCode,
+  FileJson,
 } from "lucide-react";
 import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
@@ -2089,6 +2090,20 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                 >
                   <FileCode className="w-4 h-4" strokeWidth={1.5} />
                   XML
+                </a>
+                <a
+                  href={withAuthToken(
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/json${
+                      trimMediaPath.trim()
+                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
+                        : ""
+                    }`
+                  )}
+                  title="Timeline ของ auto-editor — เอากลับไปเรนเดอร์ซ้ำหรืออ่านด้วยสคริปต์ได้ (auto-editor timeline.json -o out.mp4)"
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <FileJson className="w-4 h-4" strokeWidth={1.5} />
+                  JSON
                 </a>
                 <button
                   onClick={handleDeleteTrimmed}

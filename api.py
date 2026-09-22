@@ -22,6 +22,7 @@ from pydantic import BaseModel
 import pipeline
 import caption_polish
 import fcpxml
+import timeline_json
 import glossary as glossary_module
 import models
 import auth
@@ -1282,6 +1283,52 @@ def export_auto_trim_xml(
         content=document,
         media_type="application/xml",
         headers=_attachment_headers(f"{base}_trimmed.xml"),
+    )
+
+@app.get("/api/videos/{video_id}/auto-trim/json")
+def export_auto_trim_json(
+    video_id: int,
+    media_path: Optional[str] = Query(None, description=_MEDIA_PATH_HELP),
+    version: str = Query("3", pattern="^(1|3)$"),
+    db: Session = Depends(get_db),
+    # A link, not an XHR: the token arrives as a query param because an
+    # <a href> cannot set an Authorization header.
+    current_user: models.User = Depends(auth.get_current_user_for_media),
+):
+    """The last trim as an auto-editor timeline.
+
+    Where the XML exports go to an editor, this one goes back to auto-editor —
+    `auto-editor timeline.json -o out.mp4` re-renders from it — or to any script
+    that wants the cut list as data. `?version=1` writes the compact form, every
+    chunk of the timeline in order with the cut ones marked by speed.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    edit = _edit_for_export(video)
+    result = video.trim_result or {}
+    try:
+        document = timeline_json.build_timeline_json(
+            original_name=edit["original_name"],
+            segments=edit["segments"],
+            timebase_num=edit["timebase_num"],
+            timebase_den=edit["timebase_den"],
+            width=edit["width"],
+            height=edit["height"],
+            total_frames=int(result.get("total_frames") or 0),
+            sample_rate=edit["sample_rate"],
+            channels=edit["channels"],
+            audio_streams=int(result.get("audio_streams") or 1),
+            has_video=edit["has_video"],
+            version=version,
+            media_path=media_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    base = Path(video.original_name).stem or f"video_{video_id}"
+    return Response(
+        content=document,
+        media_type="application/json",
+        headers=_attachment_headers(f"{base}_trimmed.json"),
     )
 
 @app.get("/api/videos/{video_id}/trimmed")
