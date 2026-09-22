@@ -369,6 +369,15 @@ def auto_trim_job(job_id: str) -> dict:
 	return _auto_trim_call(f"/jobs/{job_id}", method="GET")
 
 
+def auto_trim_job_segments(job_id: str) -> dict:
+	"""Every kept range of a finished job, uncapped.
+
+	The status response caps its segment list — a poll every second should not carry
+	a megabyte of ranges — so an export asks for the full list once.
+	"""
+	return _auto_trim_call(f"/jobs/{job_id}/segments", method="GET")
+
+
 def auto_trim_cancel(job_id: str) -> dict:
 	"""Stop a job and kill the ffmpeg processes it has running."""
 	return _auto_trim_call(f"/jobs/{job_id}", method="DELETE")

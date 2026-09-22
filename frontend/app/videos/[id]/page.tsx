@@ -32,6 +32,7 @@ import {
   ChevronDown,
   Scissors,
   Cpu,
+  FileCode,
 } from "lucide-react";
 import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
@@ -114,6 +115,17 @@ interface TranscribeEstimate {
   is_estimate_only: boolean;
 }
 
+/** The loudness envelope, summarised into buckets for drawing. */
+interface TrimWaveform {
+  buckets: number;
+  /** Over the whole timeline. */
+  before: number[];
+  /** Over the kept frames only, so it lines up with the trimmed file. */
+  after: number[];
+  /** How much of each bucket the edit keeps, 0-255. */
+  kept?: number[];
+}
+
 /** What an auto trim keeps: the numbers the service reports for one edit. */
 interface TrimAnalysis {
   fps: number;
@@ -131,10 +143,20 @@ interface TrimAnalysis {
   removed_duration: number;
   removed_ratio: number;
   segment_count: number;
+  segments?: TrimSegment[];
+  waveform?: TrimWaveform | null;
   analyze_seconds: number;
 }
 
-/** A trim that was actually rendered, as stored on the video. */
+interface TrimSegment {
+  start: number;
+  end: number;
+  start_frame: number;
+  end_frame: number;
+}
+
+/** A trim that was actually rendered, as stored on the video. The stored copy
+ *  carries the envelope, so the panel can draw it after a reload. */
 interface TrimResult extends TrimAnalysis {
   output_filename: string;
   output_bytes: number;
@@ -233,6 +255,24 @@ function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+/** One envelope as a filled shape: the top edge mirrored underneath. */
+function waveformPath(values: number[], height: number, width = 1000): string {
+  if (!values.length) return "";
+  const middle = height / 2;
+  const step = width / values.length;
+  const top: string[] = [];
+  const bottom: string[] = [];
+  values.forEach((value, index) => {
+    const x = index * step;
+    // A floor of half a pixel keeps silence visible as a line rather than a gap.
+    const half = Math.max(0.4, (value / 255) * middle);
+    top.push(`${index === 0 ? "M" : "L"}${x.toFixed(2)},${(middle - half).toFixed(2)}`);
+    bottom.push(`L${x.toFixed(2)},${(middle + half).toFixed(2)}`);
+  });
+  bottom.reverse();
+  return `${top.join("")}${bottom.join("")}Z`;
 }
 
 function formatBytes(bytes: number): string {
@@ -392,6 +432,9 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [startingTrim, setStartingTrim] = useState<"analyze" | "trim" | null>(null);
   const [isCancelingTrim, setIsCancelingTrim] = useState(false);
   const [isDeletingTrim, setIsDeletingTrim] = useState(false);
+  // Where the footage lives on the editing machine. Optional: without it Final
+  // Cut imports the project and asks to relink.
+  const [trimMediaPath, setTrimMediaPath] = useState("");
   // Bumped after each render so the player reloads instead of showing the
   // previous trim from cache at the same URL.
   const [trimVersion, setTrimVersion] = useState(0);
@@ -402,6 +445,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [isDeleting, setIsDeleting] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const trimmedVideoRef = useRef<HTMLVideoElement>(null);
   const srtInputRef = useRef<HTMLInputElement>(null);
   const cueRefs = useRef<(HTMLDivElement | null)[]>([]);
   // Whether the video was actually playing when a cue edit started, so finishing the
@@ -423,6 +467,31 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [replaceNotice, setReplaceNotice] = useState<string | null>(null);
   // Which hit of the search is currently scrolled to, as an offset into matchedIndexes.
   const [matchCursor, setMatchCursor] = useState(0);
+
+  // The fresh preview if there is one, else what the last render recorded.
+  const waveformSource = trimPreview ?? video?.trim_result ?? null;
+  const trimWaveform = waveformSource?.waveform ?? null;
+  // What gets cut, in the 0-1000 space the drawing uses. Read from the per-bucket
+  // kept share rather than the segment list: the stored result carries the share
+  // (1.2 kB whatever the cut count), so the picture survives a reload. Runs of
+  // neighbouring buckets merge, so a few hundred cuts stay a few hundred bands.
+  const cutBands = (() => {
+    const kept = trimWaveform?.kept;
+    if (!kept || !kept.length) return [];
+    const step = 1000 / kept.length;
+    const bands: { x: number; width: number }[] = [];
+    let start: number | null = null;
+    kept.forEach((share, index) => {
+      const mostlyCut = share < 128;
+      if (mostlyCut && start === null) start = index;
+      if (!mostlyCut && start !== null) {
+        bands.push({ x: start * step, width: (index - start) * step });
+        start = null;
+      }
+    });
+    if (start !== null) bands.push({ x: start * step, width: (kept.length - start) * step });
+    return bands;
+  })();
 
   const captionSegments = video?.caption_segments ?? [];
   const matchedIndexes = findText
@@ -1871,10 +1940,97 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
           </div>
         )}
 
+        {/* The envelope before and after the cut. Click to hear a spot: the top
+            row seeks the original, the bottom row the trimmed render. */}
+        {waveformSource && trimWaveform && !trimJobActive && (
+          <div className="flex flex-col gap-2 rounded-xl border border-gray-100 p-3">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between text-[11px] text-gray-500">
+                <span>ก่อนตัด · {formatDuration(waveformSource.timeline_duration)}</span>
+                <span className="text-gray-400">แถบแดงคือช่วงที่จะถูกตัดออก</span>
+              </div>
+              <svg
+                viewBox="0 0 1000 60"
+                preserveAspectRatio="none"
+                className="w-full h-[60px] cursor-pointer rounded-lg bg-gray-50"
+                onClick={(event) => {
+                  const box = event.currentTarget.getBoundingClientRect();
+                  const at = ((event.clientX - box.left) / box.width) * waveformSource.timeline_duration;
+                  if (videoRef.current) {
+                    videoRef.current.currentTime = at;
+                    videoRef.current.play();
+                  }
+                }}
+              >
+                {/* Cut regions first, so the envelope draws over them. */}
+                {cutBands.map((band, index) => (
+                  <rect
+                    key={index}
+                    x={band.x}
+                    y={0}
+                    width={band.width}
+                    height={60}
+                    className="fill-red-100"
+                  />
+                ))}
+                <path d={waveformPath(trimWaveform.before, 60)} className="fill-blue-500/70" />
+                {/* The gate, mirrored: anything inside it reads as silence. */}
+                <line
+                  x1={0}
+                  x2={1000}
+                  y1={30 - waveformSource.threshold * 30}
+                  y2={30 - waveformSource.threshold * 30}
+                  className="stroke-amber-500"
+                  strokeWidth={0.5}
+                  strokeDasharray="6 4"
+                />
+                <line
+                  x1={0}
+                  x2={1000}
+                  y1={30 + waveformSource.threshold * 30}
+                  y2={30 + waveformSource.threshold * 30}
+                  className="stroke-amber-500"
+                  strokeWidth={0.5}
+                  strokeDasharray="6 4"
+                />
+              </svg>
+            </div>
+
+            {trimWaveform.after.length > 0 && (
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between text-[11px] text-gray-500">
+                  <span>หลังตัด · {formatDuration(waveformSource.output_duration)}</span>
+                  <span className="text-gray-400">
+                    {waveformSource.segment_count} ช่วงต่อกัน
+                  </span>
+                </div>
+                <svg
+                  viewBox="0 0 1000 60"
+                  preserveAspectRatio="none"
+                  className={`w-full h-[60px] rounded-lg bg-gray-50 ${
+                    video.trim_filename ? "cursor-pointer" : ""
+                  }`}
+                  onClick={(event) => {
+                    const player = trimmedVideoRef.current;
+                    if (!player) return;
+                    const box = event.currentTarget.getBoundingClientRect();
+                    player.currentTime =
+                      ((event.clientX - box.left) / box.width) * waveformSource.output_duration;
+                    player.play();
+                  }}
+                >
+                  <path d={waveformPath(trimWaveform.after, 60)} className="fill-emerald-500/70" />
+                </svg>
+              </div>
+            )}
+          </div>
+        )}
+
         {video.trim_filename && video.trim_result && !trimJobActive && (
           <div className="grid lg:grid-cols-[1fr_320px] gap-6 items-start pt-1">
             <div className="aspect-video bg-black rounded-2xl overflow-hidden">
               <video
+                ref={trimmedVideoRef}
                 key={trimVersion}
                 src={withAuthToken(`${MEDIA_BASE}/api/videos/${videoId}/trimmed?v=${trimVersion}`)}
                 controls
@@ -1904,7 +2060,35 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                   className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
                 >
                   <Download className="w-4 h-4" strokeWidth={1.5} />
-                  ดาวน์โหลด
+                  วิดีโอ
+                </a>
+                <a
+                  href={withAuthToken(
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/fcpxml${
+                      trimMediaPath.trim()
+                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
+                        : ""
+                    }`
+                  )}
+                  title="โปรเจกต์ Final Cut Pro (10.6.8+) ที่อ้างถึงไฟล์ต้นฉบับ — รอยตัดมาครบและยังขยับได้"
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <FileCode className="w-4 h-4" strokeWidth={1.5} />
+                  FCPXML
+                </a>
+                <a
+                  href={withAuthToken(
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/xml${
+                      trimMediaPath.trim()
+                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
+                        : ""
+                    }`
+                  )}
+                  title="XML แบบ Final Cut Pro 7 — Premiere Pro, DaVinci Resolve และ FCP 7 อ่านได้"
+                  className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
+                >
+                  <FileCode className="w-4 h-4" strokeWidth={1.5} />
+                  XML
                 </a>
                 <button
                   onClick={handleDeleteTrimmed}
@@ -1919,6 +2103,13 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                   ลบไฟล์ที่ตัด
                 </button>
               </div>
+              <input
+                value={trimMediaPath}
+                onChange={(e) => setTrimMediaPath(e.target.value)}
+                placeholder="โฟลเดอร์ฟุตเทจบนเครื่องตัดต่อ (ไม่ใส่ก็ได้)"
+                title="ใส่ path ที่ไฟล์ต้นฉบับอยู่บนเครื่อง Mac เช่น /Volumes/Work/footage แล้ว Final Cut จะหาไฟล์เจอเองโดยไม่ต้อง relink"
+                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-[11px] text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+              />
             </div>
           </div>
         )}
