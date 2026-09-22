@@ -36,6 +36,27 @@ interface UploadTask {
 // browser (or the server) juggle dozens of simultaneous multi-GB streams.
 const MAX_CONCURRENT_UPLOADS = 4;
 
+// A dropped file often arrives with no type at all — the browser only knows the
+// common ones, and a .mkv or a .MP4 straight off a camera can come through blank.
+// So the extension gets a say too, rather than turning away a real video.
+const VIDEO_EXTENSIONS = [
+  "mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "mts", "m2ts", "ts", "3gp",
+];
+
+function isVideoFile(file: File): boolean {
+  if (file.type.startsWith("video/")) return true;
+  if (file.type) return false;
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  return VIDEO_EXTENSIONS.includes(extension);
+}
+
+/** Whether a drag is carrying files, as opposed to the page's own row reordering
+ *  or a selection of text from somewhere else. */
+function dragHasFiles(event: React.DragEvent | DragEvent): boolean {
+  const types = event.dataTransfer?.types;
+  return types ? Array.from(types).includes("Files") : false;
+}
+
 export default function Home() {
   const [videos, setVideos] = useState<VideoItem[]>([]);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
@@ -51,6 +72,17 @@ export default function Home() {
   const [savingProject, setSavingProject] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragIdRef = useRef<number | null>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  // Dragging over a child fires `dragleave` on its parent, so the overlay cannot
+  // be driven by the events alone; counting enter against leave can.
+  const dragDepthRef = useRef(0);
+  // One queue, drained by a fixed pool. Held in refs rather than state because the
+  // pool reads them as it goes, and a render must not be what decides what uploads
+  // next.
+  const queueRef = useRef<{ task: UploadTask; file: File; projectId: Tab }[]>([]);
+  const workersRef = useRef(0);
+  // What is on screen, for uploads that finish after the tab has moved on.
+  const activeTabRef = useRef<Tab>("all");
 
   const loadProjects = async () => {
     try {
@@ -82,9 +114,54 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    activeTabRef.current = activeTab;
     loadVideos(activeTab);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
+
+  /** Catch dragged files anywhere on the page.
+   *
+   *  On the window rather than on a drop zone, because the default behaviour for a
+   *  file dropped anywhere else is for the browser to open it — navigating away
+   *  from the page and abandoning whatever was still uploading. Every drop is
+   *  caught; one over the page uploads, one that misses is simply ignored. */
+  useEffect(() => {
+    const onDragEnter = (event: DragEvent) => {
+      if (!dragHasFiles(event)) return;
+      dragDepthRef.current += 1;
+      setIsDraggingFiles(true);
+    };
+    const onDragOver = (event: DragEvent) => {
+      if (!dragHasFiles(event)) return;
+      // Without this the drop never fires and the browser opens the file instead.
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const onDragLeave = (event: DragEvent) => {
+      if (!dragHasFiles(event)) return;
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+      if (dragDepthRef.current === 0) setIsDraggingFiles(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      if (!dragHasFiles(event)) return;
+      event.preventDefault();
+      dragDepthRef.current = 0;
+      setIsDraggingFiles(false);
+      uploadFiles(Array.from(event.dataTransfer?.files ?? []), activeTabRef.current);
+    };
+
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /** One file's upload: the request body is the raw file, not multipart — the server
    *  streams it straight to disk, which is what makes this fast, and it lets a plain
@@ -103,7 +180,14 @@ export default function Home() {
           setUploadTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, progress } : t)));
         },
       });
-      setVideos((prev) => [res.data, ...prev]);
+      // Uploads now outlive the tab they were started from, so a file only joins
+      // the list on screen when that is where it actually went.
+      const showing = activeTabRef.current;
+      const belongsHere =
+        showing === "all" ||
+        (showing === "ungrouped" && res.data.project_id === null) ||
+        showing === res.data.project_id;
+      if (belongsHere) setVideos((prev) => [res.data, ...prev]);
       if (typeof projectId === "number") loadProjects();
       setUploadTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, status: "done", progress: 100 } : t)));
       // Nothing left pointing at it after this — clear the row so a batch of uploads
@@ -120,29 +204,54 @@ export default function Home() {
     }
   };
 
-  /** Runs the batch with only `MAX_CONCURRENT_UPLOADS` requests in flight at once: a
-   *  fixed pool of workers each pulling the next file off the shared queue, rather than
-   *  firing every upload at the same time or doing them one after another. */
-  const uploadFiles = (files: File[], projectId: Tab) => {
-    if (files.length === 0) return;
-    setError(null);
+  /** Start as many workers as the pool still allows; each drains the shared queue
+   *  until it is empty.
+   *
+   *  One queue for the page rather than one per batch, so files added while a batch
+   *  is running join the line instead of starting a second pool beside it — three
+   *  drops in a row would otherwise have twelve uploads fighting over the
+   *  connection, and each one would crawl. */
+  const pumpQueue = () => {
+    while (workersRef.current < MAX_CONCURRENT_UPLOADS && queueRef.current.length > 0) {
+      workersRef.current += 1;
+      void (async () => {
+        try {
+          for (;;) {
+            const item = queueRef.current.shift();
+            if (!item) break;
+            await uploadOneFile(item.task, item.file, item.projectId);
+          }
+        } finally {
+          workersRef.current -= 1;
+        }
+      })();
+    }
+  };
 
-    const tasks: UploadTask[] = files.map((file) => ({
+  /** Queue files for upload. Safe to call while others are still going. */
+  const uploadFiles = (files: File[], projectId: Tab) => {
+    const accepted = files.filter(isVideoFile);
+    const rejected = files.length - accepted.length;
+    setError(
+      rejected > 0
+        ? `${rejected} file${rejected > 1 ? "s were" : " was"} not a video and ${
+            rejected > 1 ? "were" : "was"
+          } skipped.`
+        : null
+    );
+    if (accepted.length === 0) return;
+
+    const tasks: UploadTask[] = accepted.map((file) => ({
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
       name: file.name,
       progress: 0,
       status: "pending",
     }));
     setUploadTasks((prev) => [...prev, ...tasks]);
-
-    let next = 0;
-    const worker = async () => {
-      while (next < files.length) {
-        const index = next++;
-        await uploadOneFile(tasks[index], files[index], projectId);
-      }
-    };
-    Array.from({ length: Math.min(MAX_CONCURRENT_UPLOADS, files.length) }, worker);
+    queueRef.current.push(
+      ...tasks.map((task, index) => ({ task, file: accepted[index], projectId }))
+    );
+    pumpQueue();
   };
 
   const dismissUploadTask = (id: string) => {
@@ -256,33 +365,40 @@ export default function Home() {
 
   return (
     <main className="flex-1 max-w-3xl w-full mx-auto px-8 py-16 flex flex-col gap-8">
-      <div
-        className="flex items-start justify-between gap-6 rounded-2xl transition-colors"
-        onDragOver={(e) => {
-          e.preventDefault();
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          uploadFiles(Array.from(e.dataTransfer.files), activeTab);
-        }}
-      >
+      {/* Shown while files are over the window, so it is obvious the page will
+          take them — and where. Pointer events off: it is a sign, not a target,
+          and the drop is caught on the window either way. */}
+      {isDraggingFiles && (
+        <div className="fixed inset-4 z-50 pointer-events-none rounded-3xl border-2 border-dashed border-blue-400 bg-blue-50/80 backdrop-blur-[2px] flex flex-col items-center justify-center gap-3">
+          <Upload className="w-10 h-10 text-blue-600" strokeWidth={1.5} />
+          <p className="text-lg font-medium text-blue-900">Drop to upload</p>
+          <p className="text-sm text-blue-700">
+            {typeof activeTab === "number"
+              ? `Into ${projects.find((p) => p.id === activeTab)?.name ?? "this project"}`
+              : "Videos only — anything else is skipped"}
+          </p>
+        </div>
+      )}
+      <div className="flex items-start justify-between gap-6 rounded-2xl">
         <div>
           <h1 className="text-4xl font-semibold tracking-tight text-gray-900">Videos</h1>
           <p className="text-gray-500 mt-2">
             Upload videos to transcribe and extract frames — pick several at once, or drop them here.
           </p>
         </div>
+        {/* Never disabled: the moment someone most wants to add another file is
+            while the last one is still going, and the queue is built to take it. */}
         <button
           onClick={() => fileInputRef.current?.click()}
-          disabled={isUploading}
-          className="shrink-0 bg-blue-600 text-white px-5 py-2.5 rounded-full font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2 transition-colors"
+          title={isUploading ? "Add more — they join the queue" : undefined}
+          className="shrink-0 bg-blue-600 text-white px-5 py-2.5 rounded-full font-medium hover:bg-blue-700 flex items-center gap-2 transition-colors"
         >
           {isUploading ? (
             <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
           ) : (
             <Upload className="w-4 h-4" strokeWidth={1.5} />
           )}
-          {isUploading ? `Uploading (${activeUploads.length})...` : "Upload Videos"}
+          {isUploading ? `Uploading ${activeUploads.length} — add more` : "Upload Videos"}
         </button>
         <input
           ref={fileInputRef}
@@ -434,10 +550,18 @@ export default function Home() {
               onDragStart={() => {
                 dragIdRef.current = video.id;
               }}
+              // A row dropped somewhere that is not another row leaves the drag
+              // id behind; cleared here so the next drop cannot act on it.
+              onDragEnd={() => {
+                dragIdRef.current = null;
+              }}
               onDragOver={(e) => {
-                if (canReorder) e.preventDefault();
+                if (canReorder && !dragHasFiles(e)) e.preventDefault();
               }}
               onDrop={(e) => {
+                // Files land on rows like anywhere else on the page, and are the
+                // window's to handle — a row must not read one as a reorder.
+                if (dragHasFiles(e)) return;
                 e.preventDefault();
                 handleDrop(video.id);
               }}
