@@ -94,6 +94,18 @@ pub struct Progress {
     /// bar when there is no picture to render.
     audio_frames: AtomicU64,
     audio_total: AtomicU64,
+    /// Milliseconds of finished file written, against how many are expected.
+    /// Joining and muxing a long recording is minutes of disk work, and without
+    /// this the bar has nothing to say for the whole of it.
+    finished_ms: AtomicU64,
+    finish_total_ms: AtomicU64,
+    /// The highest fraction reported so far, in millionths.
+    ///
+    /// The phases are re-weighted once the analysis has measured itself and the
+    /// render has been estimated from the kept length — a better model, but one
+    /// that can place the same moment lower than the old one did. A bar that
+    /// slides backwards reads as something having gone wrong, so it holds.
+    floor: AtomicU64,
     weights: Mutex<Option<PhaseWeights>>,
 }
 
@@ -140,6 +152,24 @@ impl Progress {
     /// bar has to span both of them.
     pub fn add_audio_total(&self, samples: u64) {
         self.audio_total.fetch_add(samples, Ordering::Relaxed);
+    }
+
+    pub fn set_finish_total_ms(&self, milliseconds: u64) {
+        self.finish_total_ms.store(milliseconds, Ordering::Relaxed);
+    }
+
+    /// The mux reports where it has reached in the file it is writing; a group
+    /// writes several, so this is how far through all of them we are.
+    pub fn set_finished_ms(&self, milliseconds: u64) {
+        let previous = self.finished_ms.load(Ordering::Relaxed);
+        if milliseconds > previous {
+            self.finished_ms.store(milliseconds, Ordering::Relaxed);
+        }
+    }
+
+    /// Everything muxed so far, when one file is done and the next is starting.
+    pub fn finished_ms(&self) -> u64 {
+        self.finished_ms.load(Ordering::Relaxed)
     }
 
     pub fn add_audio_samples(&self, samples: u64) {
@@ -199,13 +229,29 @@ impl Progress {
             render = 0.0;
         }
 
+        // Joining and muxing is not instant — on a long recording it is minutes of
+        // reading and writing — so it reports where it has got to rather than
+        // pinning the bar at whatever the render left it.
+        let finish = Self::ratio(
+            self.finished_ms.load(Ordering::Relaxed),
+            self.finish_total_ms.load(Ordering::Relaxed),
+        );
+
         let done = match phase {
             Phase::Queued => 0.0,
             Phase::Analyzing => weights.analyze * analyze,
             Phase::Rendering => weights.analyze + weights.render * render,
-            Phase::Finishing | Phase::Finished => weights.analyze + weights.render,
+            // The render's own ratio, not a flat "all of it": a group muxes each
+            // file as it finishes and then renders the next one, and assuming the
+            // whole render was done sent the bar to 99% and straight back to 50%.
+            Phase::Finishing => {
+                weights.analyze + weights.render * render + weights.finish * finish
+            }
+            Phase::Finished => weights.analyze + weights.render + weights.finish,
         };
-        (done / total).clamp(0.0, 1.0)
+        let value = (done / total).clamp(0.0, 1.0);
+        let floor = self.floor.fetch_max((value * 1e6) as u64, Ordering::Relaxed);
+        value.max(floor as f64 / 1e6)
     }
 
 }
@@ -470,6 +516,100 @@ mod tests {
 
         progress.set_phase(Phase::Finished);
         assert_eq!(progress.fraction(), 1.0);
+    }
+
+    #[test]
+    fn the_bar_never_slides_backwards() {
+        // The phases are re-weighted mid-job, once the analysis has timed itself
+        // and the render has been estimated from what the edit keeps. The new
+        // model can place the current moment lower than the old one did.
+        let progress = Progress::default();
+        progress.set_weights(PhaseWeights { analyze: 50.0, render: 50.0, finish: 0.0 });
+        progress.set_expected_frames(100);
+        progress.set_phase(Phase::Analyzing);
+        progress.add_analyzed_frames(100);
+        let after_analysis = progress.fraction();
+        assert!((after_analysis - 0.5).abs() < 1e-9);
+
+        // Measured: the analysis was a tenth of the work, not half.
+        progress.set_weights(PhaseWeights { analyze: 10.0, render: 90.0, finish: 0.0 });
+        progress.set_kept_frames(100);
+        progress.set_phase(Phase::Rendering);
+        // Really 0.1 now, which would be a slide from 0.5.
+        assert!((progress.fraction() - after_analysis).abs() < 1e-9);
+
+        // And it starts moving again as soon as the render passes where it stood.
+        progress.add_rendered_frames(60);
+        assert!(progress.fraction() > after_analysis);
+    }
+
+    #[test]
+    fn the_bar_keeps_moving_while_the_files_are_being_joined() {
+        // Joining and muxing is minutes of work on a long recording. Pinned to
+        // where the render left it, the bar sat at 99% for all of it — which is
+        // what this reported as a hang.
+        let progress = Progress::default();
+        progress.set_weights(PhaseWeights {
+            analyze: 0.0,
+            render: 90.0,
+            finish: 10.0,
+        });
+        progress.set_kept_frames(100);
+        progress.add_rendered_frames(100);
+        progress.set_finish_total_ms(60_000);
+
+        progress.set_phase(Phase::Finishing);
+        let started = progress.fraction();
+        assert!((started - 0.9).abs() < 1e-9, "{started}");
+
+        progress.set_finished_ms(30_000);
+        assert!((progress.fraction() - 0.95).abs() < 1e-9);
+        progress.set_finished_ms(60_000);
+        assert!((progress.fraction() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn muxing_one_file_of_a_group_does_not_claim_the_rest_is_rendered() {
+        // A group muxes each recording as it finishes and then renders the next.
+        // Treating the phase as "everything is rendered" put the bar at 99% and
+        // then dropped it back to half, which is what this was reported as.
+        let progress = Progress::default();
+        progress.set_weights(PhaseWeights { analyze: 0.0, render: 90.0, finish: 10.0 });
+        progress.set_kept_frames(200); // two recordings, a hundred frames each
+        progress.add_rendered_frames(100);
+        progress.set_finish_total_ms(20_000);
+
+        progress.set_phase(Phase::Finishing);
+        let half_way = progress.fraction();
+        assert!(half_way < 0.55, "half the group rendered, but the bar says {half_way}");
+
+        // And it only goes up from there.
+        progress.set_finished_ms(10_000);
+        let after_first_mux = progress.fraction();
+        assert!(after_first_mux >= half_way, "{after_first_mux} < {half_way}");
+        progress.set_phase(Phase::Rendering);
+        progress.add_rendered_frames(100);
+        assert!(progress.fraction() >= after_first_mux);
+    }
+
+    #[test]
+    fn the_mux_of_a_second_file_carries_on_from_the_first() {
+        // A group writes several files. The bar counts the time of all of them,
+        // and each mux continues the last one rather than starting again.
+        let progress = Progress::default();
+        progress.set_weights(PhaseWeights { analyze: 0.0, render: 0.0, finish: 1.0 });
+        progress.set_finish_total_ms(20_000);
+        progress.set_phase(Phase::Finishing);
+
+        progress.set_finished_ms(10_000);
+        assert!((progress.fraction() - 0.5).abs() < 1e-9);
+        // The second file's own progress starts at zero; what is passed in is the
+        // first one's total plus it, so the bar never goes backwards.
+        progress.set_finished_ms(10_000 + 5_000);
+        assert!((progress.fraction() - 0.75).abs() < 1e-9);
+        // And a late, stale report cannot pull it back.
+        progress.set_finished_ms(1_000);
+        assert!((progress.fraction() - 0.75).abs() < 1e-9);
     }
 
     #[test]

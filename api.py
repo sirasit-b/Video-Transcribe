@@ -1180,8 +1180,15 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
             logger.warning("Could not store the trim's segment list: %s", exc)
             video.trim_segments = result.get("segments") or []
 
-        # Keep the summary, drop the segment list (see models.Video.trim_result).
+        # Keep the summary, drop the segment list (see models.Video.trim_result)
+        # and the copy of every other recording's envelope: each one carries its
+        # own on its own row, and this is returned with every video in the list.
         summary = {key: value for key, value in result.items() if key != "segments"}
+        if isinstance(summary.get("tracks"), list):
+            summary["tracks"] = [
+                {key: value for key, value in track.items() if key != "waveform"}
+                for track in summary["tracks"]
+            ]
         summary.update(
             {
                 "output_filename": _trim_output_name(video.id),
@@ -1525,9 +1532,16 @@ def _reconcile_session_job(session: models.SyncSession, status: dict, db: Sessio
         result = status.get("result") or {}
         tracks = result.get("tracks") or []
         members = _session_members(session, db)
+        # Without the envelopes, which are megabytes across a group and are stored
+        # on each recording's own row anyway.
         session.result = {
             key: value for key, value in result.items() if key not in ("segments", "waveform")
         }
+        if isinstance(session.result.get("tracks"), list):
+            session.result["tracks"] = [
+                {key: value for key, value in track.items() if key != "waveform"}
+                for track in session.result["tracks"]
+            ]
 
         ranges = {}
         if status.get("mode") == "trim":
@@ -1557,8 +1571,14 @@ def _reconcile_session_job(session: models.SyncSession, status: dict, db: Sessio
             if status.get("mode") == "trim" and track.get("output_path"):
                 video.trim_filename = _session_trim_name(video.id)
                 video.trim_result = {
-                    **{k: v for k, v in (result.items() if index == 0 else []) if k not in ("tracks", "segments")},
+                    **{
+                        k: v
+                        for k, v in (result.items() if index == 0 else [])
+                        if k not in ("tracks", "segments", "waveform")
+                    },
                     **{k: v for k, v in track.items() if k != "waveform"},
+                    # Its own envelope, not the group's: this is what the page
+                    # draws for this recording.
                     "waveform": track.get("waveform"),
                     "output_filename": _session_trim_name(video.id),
                     "session_id": session.id,

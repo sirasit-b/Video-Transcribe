@@ -907,10 +907,6 @@ impl Clock {
         a_time - (self.offset_seconds + self.slope * a_time)
     }
 
-    /// The offset as it reads at `a_time`.
-    pub fn offset_at(&self, a_time: f64) -> f64 {
-        self.offset_seconds + self.slope * a_time
-    }
 }
 
 impl SyncReport {
@@ -953,28 +949,6 @@ pub fn map_levels(
             }
             let index = (b_time * b_timebase).round() as usize;
             levels.get(index).copied().unwrap_or(0)
-        })
-        .collect()
-}
-
-/// Cut the kept ranges back to the stretch both recordings cover.
-///
-/// Outside the overlap only one of the two exists, and a pair of exports where
-/// one holds moments the other cannot is a pair that slips out of step from the
-/// first missing frame onward. Losing the ends is the price of both files being
-/// the same length and the same moments all the way through.
-pub fn clamp_to_overlap(
-    segments: &[(usize, usize)],
-    timebase: f64,
-    overlap: (f64, f64),
-) -> Vec<(usize, usize)> {
-    let (first, last) = shared_frames(overlap, timebase);
-    segments
-        .iter()
-        .filter_map(|&(start, end)| {
-            let start = start.max(first);
-            let end = end.min(last);
-            (end > start).then_some((start, end))
         })
         .collect()
 }
@@ -1313,8 +1287,8 @@ mod tests {
     fn a_drifting_clock_pulls_further_apart_as_it_goes() {
         // 100ppm: a second of slip every ten thousand seconds.
         let clock = Clock { offset_seconds: 0.0, slope: 100e-6 };
-        assert!((clock.offset_at(0.0)).abs() < 1e-12);
-        assert!((clock.offset_at(3600.0) - 0.36).abs() < 1e-9);
+        // At the start they agree; an hour in they are 0.36s apart.
+        assert!(clock.to_b(0.0).abs() < 1e-12);
         assert!((clock.to_b(3600.0) - 3599.64).abs() < 1e-6);
     }
 
@@ -1389,14 +1363,15 @@ mod tests {
     }
 
     #[test]
-    fn clamping_keeps_only_the_shared_frames() {
-        // 25fps, shared from 2s to 8s: frames 50 to 200.
-        let segments = [(0usize, 60usize), (100, 150), (190, 400)];
-        let kept = clamp_to_overlap(&segments, 25.0, (2.0, 8.0));
-        assert_eq!(kept, vec![(50, 60), (100, 150), (190, 200)]);
-
-        // A range wholly outside is dropped rather than collapsed to a point.
-        assert!(clamp_to_overlap(&[(0, 10)], 25.0, (2.0, 8.0)).is_empty());
+    fn the_shared_frames_are_the_ones_wholly_inside_the_overlap() {
+        // 25fps, shared from 2s to 8s: frames 50 to 200. The edit is held to this
+        // window, which is what keeps a group the same length everywhere.
+        assert_eq!(shared_frames((2.0, 8.0), 25.0), (50, 200));
+        // Inward at both ends: a frame only counts as shared if all of it is.
+        assert_eq!(shared_frames((2.01, 7.99), 25.0), (51, 199));
+        // Nothing shared is an empty window rather than a backwards one.
+        let (first, last) = shared_frames((8.0, 2.0), 25.0);
+        assert!(last >= first && last == first);
     }
 
     #[test]

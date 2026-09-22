@@ -475,12 +475,30 @@ async fn main() {
     // Two threads per encode is the sweet spot for x264: more threads per process
     // buys less than another process does.
     let threads_per_chunk = env_usize("THREADS_PER_CHUNK", 2);
-    let workers = env_usize("ENCODE_WORKERS", (cores / threads_per_chunk).max(1));
+    // Two cores held back. Encoding is the only thing here that can saturate a
+    // machine for minutes at a time, and when it took every core the database,
+    // the API and the browser on the same machine were all starved — the site
+    // stopped answering while a trim ran, which is a worse failure than a trim
+    // that takes a little longer.
+    let workers = env_usize(
+        "ENCODE_WORKERS",
+        (cores.saturating_sub(2) / threads_per_chunk).max(1),
+    );
 
     let work_dir =
         PathBuf::from(env::var("WORK_DIR").unwrap_or_else(|_| "/tmp/auto-trim".to_string()));
     if let Err(err) = std::fs::create_dir_all(&work_dir) {
         eprintln!("could not create WORK_DIR {}: {err}", work_dir.display());
+    }
+    // Anything left in there is from a run that was killed: no job survives a
+    // restart, and gigabytes of orphaned chunks would sit on the disk for good.
+    let (swept, freed) = sweep_work_dir(&work_dir);
+    if swept > 0 {
+        eprintln!(
+            "auto-trim: cleared {swept} leftover scratch files ({:.1} GB) from {}",
+            freed as f64 / 1e9,
+            work_dir.display()
+        );
     }
 
     let work_dir_for_cache = work_dir.clone();
@@ -590,6 +608,56 @@ fn failed(message: impl Into<String>) -> Problem {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: message.into(),
     }
+}
+
+/// Free space on the filesystem holding `path`, in bytes.
+///
+/// Read from `df` rather than through a crate: it is one call at the start of a
+/// render, and the alternative is a dependency for a syscall.
+fn free_bytes(path: &Path) -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .args(["-Pk"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Filesystem 1024-blocks Used Available Capacity Mounted-on
+    let available: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(available * 1024)
+}
+
+/// Room to ask for, given what the render expects to write.
+///
+/// A tenth on top, and never less than half a gigabyte of slack: the estimate is
+/// made from the input's size and a re-encode can exceed it, and a disk left with
+/// nothing spare is a disk that fails at something else instead.
+fn required_bytes(needed: u64) -> u64 {
+    needed + (needed / 10).max(512 * 1024 * 1024)
+}
+
+/// Refuse a render that does not have room to finish.
+///
+/// Every chunk and every soundtrack is written out before being joined, so the
+/// work directory holds roughly the whole output, and the finished file is
+/// written beside it — twice the output, plus room to spare. Running out part way
+/// through does not fail politely: it takes down whatever else shares the disk,
+/// and on this machine that is the database.
+fn check_space(work_dir: &Path, output: &Path, needed_bytes: u64) -> Result<(), Problem> {
+    let wanted = required_bytes(needed_bytes);
+    for place in [work_dir, output.parent().unwrap_or(work_dir)] {
+        if let Some(free) = free_bytes(place) {
+            if free < wanted {
+                return Err(bad_request(format!(
+                    "this trim needs about {:.1} GB free and {} has {:.1} GB; \
+                     free some space and start it again",
+                    wanted as f64 / 1e9,
+                    place.display(),
+                    free as f64 / 1e9,
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a probe established about a source, before any decoding.
@@ -808,6 +876,20 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
         state.workers,
     );
 
+    if trim {
+        // Sized from the sources: the cut is a re-encode of the part that is kept,
+        // so at worst it is as big as the whole input, and it exists twice while
+        // the chunks are joined.
+        let bytes = |source: &Source| {
+            std::fs::metadata(&source.path)
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        let needed = 2 * (bytes(&source) + others.iter().map(|(s, _)| bytes(s)).sum::<u64>());
+        let target = output.as_deref().unwrap_or(&state.work_dir);
+        check_space(&state.work_dir, target, needed)?;
+    }
+
     let mode = match request.mode {
         RequestMode::Trim => Mode::Trim,
         RequestMode::Sync => Mode::Sync,
@@ -881,6 +963,37 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
 // The work
 // ---------------------------------------------------------------------------
 
+/// Delete the scratch files of jobs that did not finish.
+///
+/// No job survives a restart — the registry is in memory — so anything shaped like
+/// a chunk, a spliced soundtrack or a chunk list is left over from a process that
+/// was killed, and would sit on the disk until someone noticed. The cache of
+/// measured levels is deliberately not touched: it is the one thing here that is
+/// worth keeping between runs.
+fn sweep_work_dir(work_dir: &Path) -> (usize, u64) {
+    let mut count = 0;
+    let mut bytes = 0;
+    let Ok(entries) = std::fs::read_dir(work_dir) else {
+        return (0, 0);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let looks_like_scratch = name.ends_with("-chunks.txt")
+            || (name.contains("-v") && name.ends_with(".mp4"))
+            || name.ends_with(".m4a")
+            || name.ends_with(".mka");
+        if !looks_like_scratch || !entry.path().is_file() {
+            continue;
+        }
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if std::fs::remove_file(entry.path()).is_ok() {
+            count += 1;
+            bytes += size;
+        }
+    }
+    (count, bytes)
+}
+
 /// The loudest level in each bucket, as a byte. Peaks are what a waveform is
 /// made of; averaging would hide the quiet frames the edit turns on.
 fn peaks(levels: &[u16], buckets: usize) -> Vec<u8> {
@@ -948,6 +1061,25 @@ struct Cut<'a> {
     streams: &'a [audio::StreamAnalysis],
     segments: &'a [(usize, usize)],
     kept_frames: usize,
+}
+
+impl Cut<'_> {
+    /// Samples of audio this cut will splice, across every track.
+    fn audio_samples(&self) -> u64 {
+        self.streams
+            .iter()
+            .map(|analysis| {
+                let frames = analysis.levels.len();
+                self.segments
+                    .iter()
+                    .map(|&(start, end)| {
+                        analysis.boundaries[end.min(frames)]
+                            - analysis.boundaries[start.min(frames)]
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
 }
 
 impl Decision {
@@ -1700,13 +1832,35 @@ fn run_job(
         threads_per_chunk: state.threads_per_chunk,
     };
 
-    // A group renders once per member, so the bar has to count all of them from
-    // the start; otherwise it reaches the end partway through the job.
-    if grouped {
-        let total: usize = decision.kept_frames
-            + members.iter().skip(1).map(|m| m.kept_frames()).sum::<usize>();
-        job.progress.set_kept_frames(total as u64);
-    }
+    // A group renders once per member, so every denominator the bar divides by has
+    // to count all of them before the first one starts. Grown as each member
+    // begins instead, the bar reaches the end partway through the job and then
+    // sits there — which is exactly what it did.
+    let cuts: Vec<Cut> = std::iter::once(decision.cut())
+        .chain(members.iter().skip(1).map(|member| member.cut()))
+        .collect();
+    job.progress
+        .set_kept_frames(cuts.iter().map(|cut| cut.kept_frames as u64).sum());
+    job.progress
+        .add_audio_total(cuts.iter().map(|cut| cut.audio_samples()).sum());
+    // Muxing is measured in output time, so the total is how long everything the
+    // job writes runs for.
+    job.progress.set_finish_total_ms(
+        members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                let fps = member.source.timebase.as_f64().max(1.0);
+                let frames = if index == 0 {
+                    decision.kept_frames
+                } else {
+                    member.kept_frames()
+                };
+                (frames as f64 / fps * 1000.0) as u64
+            })
+            .sum(),
+    );
+    drop(cuts);
 
     let render_started = Instant::now();
     let reference_options = render::RenderOptions {
@@ -1829,6 +1983,10 @@ fn render_all(
     output: &Path,
     tag: &str,
 ) -> WorkResult<Rendered> {
+    // Each member of a group renders and then muxes; without this the phase stays
+    // on the first one's mux and every later recording encodes for minutes under
+    // a bar that says it is joining files, frozen where the first one left it.
+    job.progress.set_phase(Phase::Rendering);
     let timebase = source.timebase.as_f64();
     let chunks = if source.info.has_video {
         render::plan_chunks(
@@ -1843,20 +2001,6 @@ fn render_all(
         Vec::new()
     };
 
-    let audio_total: u64 = cut
-        .streams
-        .iter()
-        .map(|analysis| {
-            let frames = analysis.levels.len();
-            cut.segments
-                .iter()
-                .map(|&(start, end)| {
-                    analysis.boundaries[end.min(frames)] - analysis.boundaries[start.min(frames)]
-                })
-                .sum::<u64>()
-        })
-        .sum();
-    job.progress.add_audio_total(audio_total);
 
     let path = &source.path;
     let audio_extension = if options.audio_codec == "aac" {
@@ -2013,6 +2157,7 @@ fn render_all(
         output,
         &state.work_dir,
         tag,
+        job.progress.finished_ms(),
         job,
     );
 
@@ -2118,6 +2263,16 @@ mod tests {
             }],
             duration,
         }
+    }
+
+    #[test]
+    fn room_is_asked_for_with_slack_on_top() {
+        // Half a gigabyte of slack on a small job, a tenth on a large one, so the
+        // disk is never left with nothing spare.
+        assert_eq!(required_bytes(0), 512 * 1024 * 1024);
+        assert_eq!(required_bytes(1_000_000_000), 1_000_000_000 + 512 * 1024 * 1024);
+        // 100GB: a tenth is more than the floor, so the tenth wins.
+        assert_eq!(required_bytes(100_000_000_000), 110_000_000_000);
     }
 
     #[test]
