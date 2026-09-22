@@ -103,18 +103,35 @@ def test_media_path_makes_an_absolute_file_url():
     assert src == "file:///Volumes/Work/footage/lecture%2001.mp4"
 
 
-def test_without_a_media_path_the_bare_name_is_used():
+def test_without_a_media_path_the_src_is_relative_to_the_document():
+    # file:///lecture 01.mp4 is the root of the disk, which never exists — Final
+    # Cut reported missing media for exactly that. A relative URL resolves against
+    # the folder the .fcpxml sits in, so the XML beside the footage just links.
     root = ET.fromstring(build())
     src = root.find("./resources/asset/media-rep").attrib["src"]
-    assert src == "file:///lecture%2001.mp4"
+    assert src == "lecture%2001.mp4"
+    assert "://" not in src and not src.startswith("/")
 
 
 def test_a_thai_filename_survives_as_a_url_and_as_xml():
     xml = build(original_name="บทเรียน & เสียง.mp4")
     root = ET.fromstring(xml)  # would raise if the name broke the document
     src = root.find("./resources/asset/media-rep").attrib["src"]
-    assert src.startswith("file:///%E0%B8%9A")
+    assert src.startswith("%E0%B8%9A")
     assert root.find("./library/event/project").attrib["name"] == "บทเรียน & เสียง"
+
+    absolute = ET.fromstring(build(original_name="บทเรียน.mp4", media_path="/Volumes/Work"))
+    assert absolute.find("./resources/asset/media-rep").attrib["src"] == (
+        "file:///Volumes/Work/%E0%B8%9A%E0%B8%97%E0%B9%80%E0%B8%A3%E0%B8%B5%E0%B8%A2%E0%B8%99.mp4"
+    )
+
+
+def test_a_media_path_without_a_leading_slash_still_makes_an_absolute_url():
+    # Someone pastes "Volumes/Work/footage"; it still has to be a real path.
+    root = ET.fromstring(build(media_path="Volumes/Work/footage"))
+    assert root.find("./resources/asset/media-rep").attrib["src"] == (
+        "file:///Volumes/Work/footage/lecture%2001.mp4"
+    )
 
 
 def test_audio_layout_follows_the_channel_count():
@@ -224,6 +241,18 @@ def test_xmeml_writes_ntsc_as_a_flag_on_a_whole_timebase():
     assert clip.findtext("out") == "24"
 
 
+def test_xmeml_src_is_relative_without_a_media_path_too():
+    root = ET.fromstring(build_xml())
+    pathurl = root.findtext(".//file/pathurl")
+    assert pathurl == "lecture%2001.mp4"
+    assert "://" not in pathurl
+
+    absolute = ET.fromstring(build_xml(media_path="/Volumes/Work/footage"))
+    assert absolute.findtext(".//file/pathurl") == (
+        "file:///Volumes/Work/footage/lecture%2001.mp4"
+    )
+
+
 def test_xmeml_defines_the_file_once_and_references_it_after():
     root = ET.fromstring(build_xml())
     files = root.findall(".//file")
@@ -233,7 +262,7 @@ def test_xmeml_defines_the_file_once_and_references_it_after():
     assert len(defined) == 1
     assert defined[0].attrib["id"] == "file-1"
     assert all(f.attrib["id"] == "file-1" for f in files)
-    assert defined[0].findtext("pathurl") == "file:///lecture%2001.mp4"
+    assert defined[0].findtext("pathurl") == "lecture%2001.mp4"
 
 
 def test_xmeml_links_every_clip_to_its_own_audio():
@@ -274,7 +303,7 @@ def test_xmeml_audio_clips_point_at_the_audio_of_the_source():
 def test_xmeml_escapes_a_thai_name():
     root = ET.fromstring(build_xml(original_name="บทเรียน & เสียง.mp4"))
     assert root.findtext("./sequence/name") == "บทเรียน & เสียง"
-    assert root.findtext(".//file/pathurl").startswith("file:///%E0%B8%9A")
+    assert root.findtext(".//file/pathurl").startswith("%E0%B8%9A")
 
 
 def test_xmeml_skips_degenerate_segments():

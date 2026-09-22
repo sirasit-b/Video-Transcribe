@@ -361,6 +361,12 @@ def auto_trim_start(
 	}
 	if output_path is not None:
 		payload["output_path"] = str(Path(output_path).resolve())
+	# The pair's two paths travel the same way as the first one's: the service
+	# reads a relative path against its own video root, which is a different
+	# directory from ours, so every path leaves here absolute.
+	for key in ("second_video_path", "second_output_path"):
+		if payload.get(key):
+			payload[key] = str(Path(payload[key]).resolve())
 	return _auto_trim_call("/jobs", payload)
 
 

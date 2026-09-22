@@ -56,22 +56,29 @@ def _format_name(width: int, height: int, fps: float) -> str:
 
 
 def _media_uri(original_name: str, media_path: str | None) -> str:
-    """A `file://` URL for the source.
+    """Where the document says its media is.
 
-    Final Cut relinks media it cannot find, so a bare filename still imports — it
-    just asks where the footage lives. `media_path` (the folder the footage sits in
-    on the editing machine) spares that step.
+    Without a folder this is a **relative** URL — just the file name — which the
+    editor resolves against the folder the document itself is in. Download the XML
+    beside the footage and it links with nothing to do.
+
+    The obvious-looking alternative, `file:///C6176.MP4`, is the one thing that can
+    never work: that is the root of the disk. It is what this wrote at first, and
+    Final Cut reported missing media every time.
+
+    With `media_path` it becomes an absolute `file://` URL, for footage that lives
+    somewhere known on the editing machine.
     """
     name = PurePosixPath(original_name.replace("\\", "/")).name or "source.mp4"
-    if media_path:
-        folder = media_path.replace("\\", "/").rstrip("/")
-        path = f"{folder}/{name}"
-    else:
-        path = f"/{name}"
-    if not path.startswith("/"):
-        path = f"/{path}"
+    if not media_path:
+        # No slashes in a bare name, so nothing needs to stay unescaped.
+        return quote(name, safe="-._~")
+
+    folder = media_path.replace("\\", "/").rstrip("/")
+    if not folder.startswith("/"):
+        folder = f"/{folder}"
     # Keep the separators; encode everything a URL cannot carry (spaces, Thai, ...).
-    return "file://" + quote(path, safe="/-._~")
+    return "file://" + quote(f"{folder}/{name}", safe="/-._~")
 
 
 def _project_name(original_name: str) -> str:

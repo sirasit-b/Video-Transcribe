@@ -63,6 +63,14 @@ class Video(Base):
     # enough to be worth keeping out of VideoResponse, and only read when an edit
     # is exported to an editor.
     trim_segments = Column(JSON, nullable=True)
+    # The other recording of the same session — a camera take and a screen capture
+    # are two views of one moment, and once they have been lined up they are cut
+    # together. Set on both rows, each pointing at the other.
+    pair_video_id = Column(Integer, nullable=True)
+    # What lining them up found: the gap between them, how certain that is, and
+    # whether the two recorders kept the same time. Kept so a later trim can reuse
+    # it, and so the panel can show it without measuring again.
+    sync_result = Column(JSON, nullable=True)
     is_deleted = Column(Boolean, nullable=False, default=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

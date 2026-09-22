@@ -22,6 +22,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 |-- glossary.py             # The word system: ASR error rules + one-pass corrector
 |-- caption_polish.py       # Line splitting, spacing repair, timestamp sanitising
 |-- fcpxml.py               # Editor projects for an auto-trimmed edit (FCPXML and FCP7 XML)
+|-- timeline_json.py        # auto-editor's own timeline JSON for the same edit
 |-- pricing.py              # Per-run time and cost estimates
 |-- docker-compose.yml      # Multi-service local stack
 |-- docker-compose.vaapi.yml   # Overlay: pass an Intel/AMD GPU to the trim service
@@ -41,8 +42,8 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Extract evenly spaced frames from videos
 - Cut the silent parts out of a video with one button, using auto-editor's edit decision
 - See the loudness envelope before and after the cut, and export the edit as an
-  editor project — FCPXML or Final Cut Pro 7 XML (Premiere, Resolve) — still
-  pointing at the original footage
+  editor project — FCPXML, Final Cut Pro 7 XML (Premiere, Resolve) or auto-editor's
+  own timeline JSON — still pointing at the original footage
 - Transcribe video audio to Thai text with per-segment timestamps, choosing the model per run
 - See the projected time and cost *before* transcribing, and the actual figures after
 - Fix ASR errors from a persistent word system in a single pass, with every change highlighted
@@ -155,6 +156,7 @@ Base URL: `http://localhost:8734`
 - `DELETE /api/videos/{video_id}/auto-trim/job` - cancel it, killing the encodes
 - `GET /api/videos/{video_id}/auto-trim/fcpxml?media_path=&version=11` - the edit as a Final Cut Pro project
 - `GET /api/videos/{video_id}/auto-trim/xml?media_path=` - the edit as Final Cut Pro 7 XML (Premiere, Resolve)
+- `GET /api/videos/{video_id}/auto-trim/json?version=3&media_path=` - the edit as an auto-editor timeline
 - `GET /api/videos/{video_id}/trimmed?download=1` - stream or download the trimmed render
 - `DELETE /api/videos/{video_id}/trimmed` - discard the trimmed render
 - `GET /api/transcribe-models` - transcription models the UI can offer, with per-minute cost
@@ -270,6 +272,7 @@ Two buttons next to the video download, for the two XMLs editors read:
 |---|---|---|
 | **FCPXML** | `/auto-trim/fcpxml` | Final Cut Pro 10.6.8 and later (`?version=10` for a little older) |
 | **XML** | `/auto-trim/xml` | Premiere Pro, DaVinci Resolve, Final Cut Pro 7 |
+| **JSON** | `/auto-trim/json` | auto-editor itself, and anything that wants the cut list as data |
 
 Either way the XML references the **original** upload, not the trimmed render, so
 the editor opens a project whose cuts are already made but still adjustable —
@@ -287,9 +290,27 @@ The two count time differently, and both have a trap:
   one audio track per channel, each clip linked to its picture so they move
   together, which is what Premiere expects.
 
-Editors relink media they cannot find, so both files import as-is and ask where the
-footage lives. Filling in the footage folder next to the buttons (or
-`?media_path=/Volumes/Work/footage`) spares that step.
+### Where the exports say the footage is
+
+By default every export references the footage by **name only** — a relative URL,
+which the editor resolves against the folder the document itself is in. Download
+the XML beside the original video and it links with nothing to do.
+
+This started out writing `file:///C6176.MP4` when no folder was given, which is the
+root of the disk and therefore never exists: Final Cut on macOS reported missing
+media every time. A relative reference is the sane default; an absolute one is for
+footage that lives somewhere known.
+
+The picker under the export buttons chooses between the two and shows what will be
+written, because getting it wrong is exactly what makes an editor ask for the file:
+
+| Choice | The document says | Use when |
+|---|---|---|
+| วางไฟล์ export ไว้โฟลเดอร์เดียวกับวิดีโอต้นฉบับ (default) | `C6176.MP4` | the XML and the footage end up in one folder |
+| ระบุโฟลเดอร์ | `file:///Users/you/Movies/raw/C6176.MP4` | the footage has a fixed home on the editing machine |
+
+The folder is remembered in the browser, so it is typed once. On the API it is
+`?media_path=/Users/you/Movies/raw`, and it applies to all three exports.
 
 [`fcpxml.py`](fcpxml.py) writes both, shaped after auto-editor's
 `src/exports/fcp11.nim` and `src/exports/fcp7.nim` — the reference for what these
@@ -297,6 +318,34 @@ apps actually accept. [`test_fcpxml.py`](test_fcpxml.py) covers the parts that f
 silently: frame rationals, NTSC flags, clips sitting end to end, one file
 definition referenced by every clip, links that resolve, Thai filenames as both URL
 and XML, and the two documents agreeing on the same edit.
+
+### Exporting the cut list as data
+
+**JSON** writes auto-editor's own timeline ([`timeline_json.py`](timeline_json.py)),
+which goes back where the XMLs cannot: `auto-editor timeline.json -o out.mp4`
+re-renders from it, and a script can read it without parsing XML.
+
+`?version=3` (the default) is the full timeline — resolution, sample rate, layout,
+one clip per kept range on a video layer and an audio layer per stream, exactly what
+`--export json` writes. `?version=1` is the compact cut list: every chunk of the
+timeline in order, kept ones at speed 1 and cut ones at auto-editor's 99999
+("drop this"), so nothing is left implicit. Here `src` is a filesystem path rather
+than a `file://` URL, because that is what auto-editor opens.
+
+### Verified against auto-editor itself
+
+The released auto-editor (29.3.1 from PyPI) was given the same file and asked for
+its own decision, and our exports were handed back to it:
+
+- It **imported both JSON timelines and re-rendered them**: 523 frames each, against
+  the 523 frames our own renderer produced.
+- Feeding *its* per-frame levels through our ported mask reproduces its cut
+  boundaries exactly — `(0,24) (34,146) (147,395) (410,522) (1194,1220)` — so the
+  loudness analysis and the margin agree frame for frame across all 1272 frames.
+- Its own edit keeps 522 frames where ours keeps 523: a single frame, and not a
+  discrepancy. The vendored source tree is 31.6.1, which added the `--smooth`
+  pass (mincut/minclip) that fills a one-frame gap at frame 146; the 29.3.1 release
+  has no `--smooth` at all. Our port follows the tree it was ported from.
 
 ### The edit decision is auto-editor's
 
@@ -372,6 +421,13 @@ frame boundaries the analysis used, and streams them into one encoder (so there 
 single encoder priming block and no drift at the joins). Decoding, splicing and
 encoding run on separate threads, and progress comes from the encoder's own report
 rather than from what has been fed to it.
+
+Each kept range gets a **3ms ramp at both ends** (`AUDIO_FADE_MS`), as auto-editor
+does at every clip edge. With the default margin a cut lands in silence and the ramp
+changes nothing audible, but with a small margin or a high threshold it lands
+mid-waveform, where joining two pieces steps the signal and clicks. Measured on a
+deliberately bad edit (no margin, 25% threshold, nine cuts through speech): the step
+across the joins went from 5461 out of 32768 to 30.
 
 Every render is checked against the edit: the frames ffmpeg reports across all
 chunks must match the frames the mask keeps, or the job fails rather than writing a
@@ -502,6 +558,7 @@ differently depending on deployment is worse than a clear error.
 | `VAAPI_DEVICE` | auto-trim | `/dev/dri/renderD128` | which render node VAAPI uses |
 | `PRESET`, `CRF` | auto-trim | `veryfast`, 20 | quality, translated per encoder family (`-cq` for NVENC, `-global_quality` for QSV, `-qp` for VAAPI) |
 | `AAC_CODER` | auto-trim | `fast` | ffmpeg's default (`twoloop`) is half the speed at the same bitrate |
+| `AUDIO_FADE_MS` | auto-trim | 3 | ramp at each end of a kept range, so a splice cannot click; 0 turns it off |
 | `LEVEL_CACHE`, `LEVEL_CACHE_MB` | auto-trim | on, 2048 | analysis cache and its size cap |
 | `JOB_RETENTION_SECONDS` | auto-trim | 7200 | how long a finished job stays pollable |
 | `WORK_DIR` | auto-trim | `/tmp/auto-trim` | scratch space and the level cache |
@@ -510,6 +567,26 @@ Errors keep their meaning: a file with no audio track answers 400, one over the
 length limit answers 400 with its length, an edit that would keep nothing answers
 422, too many jobs answers 429 — and a failed or cancelled run leaves any previous
 render untouched.
+
+### J-cuts and other split edits
+
+A J-cut (audio of the next line starting before its picture) and an L-cut (picture
+holding after the audio has moved on) are *split* edits: the audio and the picture
+cut at different points. On a single continuous take that cannot be done
+automatically without a cost — shifting one track against the other either breaks
+lip sync for the rest of the clip or drops frames of picture that the audio still
+covers. It is an editorial call about *which* shot to hold on, which is why editors
+make it between shots.
+
+What is here instead:
+
+- **Asymmetric margins.** `margin_start` and `margin_end` are separate, so keeping
+  0.3s before speech and 0.1s after gives the breath-before-the-line feel that
+  people usually want from a J-cut, without touching sync.
+- **Real split edits in the editor.** Every export puts each kept range on the
+  timeline as its own clip with its audio linked, which is exactly the material a
+  roll edit works on: unlink, drag the audio edge past the video edge, and that is a
+  J-cut — one drag per cut, in Final Cut, Premiere or Resolve.
 
 ### Not included
 
