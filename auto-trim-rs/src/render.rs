@@ -51,6 +51,8 @@ pub struct RenderOptions {
     /// Milliseconds of ramp at each end of a kept range, so a splice that lands
     /// mid-waveform does not click. 0 turns it off.
     pub audio_fade_ms: f64,
+    /// How far this track moves to match the rest of its group, in decibels.
+    pub audio_gain_db: f64,
     pub threads_per_chunk: usize,
 }
 

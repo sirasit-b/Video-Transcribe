@@ -102,6 +102,9 @@ def init_database():
                 conn.execute(
                     text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS sync_result JSONB")
                 )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS sync_session_id INTEGER")
+                )
                 position_exists = conn.execute(
                     text(
                         "SELECT 1 FROM information_schema.columns "
@@ -248,6 +251,7 @@ class VideoResponse(BaseModel):
     trim_result: Optional[dict] = None
     trim_job_id: Optional[str] = None
     # The other recording of the same session, and how the two line up.
+    sync_session_id: Optional[int] = None
     pair_video_id: Optional[int] = None
     sync_result: Optional[dict] = None
     project_id: Optional[int] = None
@@ -412,6 +416,33 @@ class AutoTrimRequest(BaseModel):
     # Whose sound decides the cut: "both" keeps a moment either recording spoke
     # in, "primary" listens only to this one.
     edit_source: Optional[str] = Field(default=None, pattern="^(both|primary)$")
+
+
+class SyncSessionCreate(BaseModel):
+    name: Optional[str] = None
+    # Recordings to start with; more can be added later, including by uploading
+    # straight into the session.
+    video_ids: List[int] = []
+
+
+class SyncSessionMembers(BaseModel):
+    video_ids: List[int]
+
+
+class SessionSyncRequest(BaseModel):
+    # Checking whether the recorders kept the same time costs a few excerpt reads
+    # and is worth it for anything longer than a few minutes.
+    check_drift: Optional[bool] = None
+
+
+class SyncSessionTrimRequest(AutoTrimRequest):
+    """A session trim takes the same editing settings as any other, plus what to
+    do about the levels."""
+
+    # Off only for a group that is already matched, or one where the levels are
+    # deliberately different.
+    normalize_audio: Optional[bool] = None
+    loudness_target: Optional[float] = None
 
 
 class SyncRequest(BaseModel):
@@ -678,6 +709,9 @@ async def upload_video(
     request: Request,
     filename: str = Query(..., min_length=1, description="Original filename from the client"),
     project_id: Optional[int] = Query(None),
+    session_id: Optional[int] = Query(
+        None, description="Join this session of several recordings of one moment"
+    ),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
@@ -699,6 +733,19 @@ async def upload_video(
         )
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
+    if session_id is not None:
+        # Checked before a byte is written, so a wrong id is a refusal rather than
+        # an upload that lands nowhere.
+        session = (
+            db.query(models.SyncSession)
+            .filter(
+                models.SyncSession.id == session_id,
+                models.SyncSession.owner_id == current_user.id,
+            )
+            .first()
+        )
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
 
     file_path, safe_filename = _reserve_video_path(filename)
 
@@ -730,11 +777,18 @@ async def upload_video(
         original_name=os.path.basename(filename) or filename,
         owner_id=current_user.id,
         project_id=project_id,
+        sync_session_id=session_id,
         position=_next_position(db, current_user.id, project_id),
     )
     db.add(db_video)
     db.commit()
     db.refresh(db_video)
+
+    if session_id is not None and session.reference_video_id is None:
+        # The first recording in is the one the others are placed against, until
+        # someone says otherwise.
+        session.reference_video_id = db_video.id
+        db.commit()
 
     return db_video
 
@@ -1039,6 +1093,17 @@ def _trim_output_name(video_id: int) -> str:
     return f"trimmed/video_{video_id}.mp4"
 
 
+def _first_other(result: dict) -> dict:
+    """The one other recording in a result, for the two-recording flow.
+
+    The service answers with every member of the group, the first of which is the
+    file the job was started from. A pair is a group of two, so what this page
+    wants is the one after it.
+    """
+    tracks = (result or {}).get("tracks") or []
+    return tracks[1] if len(tracks) > 1 else {}
+
+
 def _paired_video(
     video: models.Video, second_video_id: int, db: Session, current_user: models.User
 ) -> models.Video:
@@ -1099,8 +1164,7 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
         return status
 
     if state == "done" and status.get("mode") == "sync":
-        result = status.get("result") or {}
-        report = result.get("sync") or {}
+        report = _first_other(status.get("result") or {}).get("sync") or {}
         second = db.query(models.Video).filter(models.Video.id == video.pair_video_id).first()
         if second is not None and report:
             _remember_pair(video, second, report, db)
@@ -1131,7 +1195,7 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
         # A paired trim produced a second file, which belongs to the second
         # recording: its own page then shows it, plays it and deletes it exactly
         # as a trim of its own would.
-        paired = result.get("second") or {}
+        paired = _first_other(result)
         second = db.query(models.Video).filter(models.Video.id == video.pair_video_id).first()
         if paired and second is not None:
             second.trim_filename = _trim_output_name(second.id)
@@ -1143,14 +1207,14 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
             }
             try:
                 full = pipeline.auto_trim_job_segments(status["job_id"])
-                second_ranges = (full or {}).get("second") or {}
-                second.trim_segments = second_ranges.get("segments") or []
-                if second_ranges.get("timebase"):
-                    second.trim_result["timebase"] = second_ranges["timebase"]
+                ranges = ((full or {}).get("tracks") or [{}])[0]
+                second.trim_segments = ranges.get("segments") or []
+                if ranges.get("timebase"):
+                    second.trim_result["timebase"] = ranges["timebase"]
             except pipeline.AutoTrimError as exc:
                 logger.warning("Could not store the paired trim's segments: %s", exc)
-            if result.get("sync"):
-                _remember_pair(video, second, result["sync"], db)
+            if paired.get("sync"):
+                _remember_pair(video, second, paired["sync"], db)
 
     # A failed or cancelled run leaves any previous render untouched; only the
     # pointer to the job goes away.
@@ -1238,9 +1302,13 @@ def auto_trim_video(
     if payload.second_video_id is not None:
         second = _paired_video(video, payload.second_video_id, db, current_user)
         paired = {
-            "second_video_path": str(VIDEOS_DIR / second.filename),
-            "second_output_path": str(VIDEOS_DIR / _trim_output_name(second.id)),
-            "offset_seconds": payload.offset_seconds,
+            "others": [
+                {
+                    "video_path": str(VIDEOS_DIR / second.filename),
+                    "output_path": str(VIDEOS_DIR / _trim_output_name(second.id)),
+                    "offset_seconds": payload.offset_seconds,
+                }
+            ],
             "edit_source": payload.edit_source,
         }
 
@@ -1290,7 +1358,7 @@ def sync_with_second_video(
         status = pipeline.auto_trim_start(
             str(source),
             mode="sync",
-            second_video_path=str(VIDEOS_DIR / second.filename),
+            others=[{"video_path": str(VIDEOS_DIR / second.filename)}],
             check_drift=payload.check_drift,
         )
     except pipeline.AutoTrimError as exc:
@@ -1375,6 +1443,406 @@ def cancel_auto_trim_job(
     video.trim_job_id = None
     db.commit()
     return status
+
+# ---------------------------------------------------------------------------
+# Sessions: several recordings of one moment
+# ---------------------------------------------------------------------------
+# A camera on the person and a capture of their screen are one take recorded
+# twice. Cutting them separately puts the cuts in different places and the two
+# never fit together again, so a session does the three things in the order they
+# depend on each other: level, line up, cut.
+#
+# Levelling is not cosmetic. The edit keeps frames louder than a threshold
+# measured against full scale, and a laptop capturing its own screen runs thirty
+# decibels under a lapel microphone — at that level every frame of it reads as
+# silence and the whole recording is cut away. The lining-up is unaffected by
+# level, which is why it has to be the levels that are fixed rather than the match.
+
+
+def _get_owned_session(
+    session_id: int, db: Session, current_user: models.User
+) -> models.SyncSession:
+    session = (
+        db.query(models.SyncSession)
+        .filter(models.SyncSession.id == session_id)
+        .first()
+    )
+    if session is None or session.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+def _session_members(session: models.SyncSession, db: Session) -> List[models.Video]:
+    """The session's recordings, reference first.
+
+    The order is what the service is handed and what its answer comes back in, so
+    it has to be the same every time it is worked out.
+    """
+    members = (
+        db.query(models.Video)
+        .filter(
+            models.Video.sync_session_id == session.id,
+            models.Video.is_deleted == False,  # noqa: E712
+        )
+        .order_by(models.Video.id)
+        .all()
+    )
+    reference = next((v for v in members if v.id == session.reference_video_id), None)
+    if reference is None:
+        return members
+    return [reference] + [v for v in members if v.id != reference.id]
+
+
+def _session_payload(session: models.SyncSession, db: Session) -> dict:
+    members = _session_members(session, db)
+    return {
+        "id": session.id,
+        "name": session.name,
+        "reference_video_id": session.reference_video_id or (members[0].id if members else None),
+        "job_id": session.job_id,
+        "result": session.result,
+        "created_at": session.created_at,
+        "videos": [VideoResponse.model_validate(video) for video in members],
+    }
+
+
+def _session_trim_name(video_id: int) -> str:
+    return _trim_output_name(video_id)
+
+
+def _reconcile_session_job(session: models.SyncSession, status: dict, db: Session) -> dict:
+    """Record a finished session job on the session and on each recording.
+
+    Polling is what commits a result, exactly as it is for a single trim: the job
+    id stays on the row until a poll — from any tab, any worker — files what it
+    found.
+    """
+    state = status.get("state")
+    if state not in ("done", "failed", "canceled"):
+        return status
+
+    if state == "done":
+        result = status.get("result") or {}
+        tracks = result.get("tracks") or []
+        members = _session_members(session, db)
+        session.result = {
+            key: value for key, value in result.items() if key not in ("segments", "waveform")
+        }
+
+        ranges = {}
+        if status.get("mode") == "trim":
+            try:
+                full = pipeline.auto_trim_job_segments(status["job_id"]) or {}
+                # The reference's ranges sit at the top level; the others follow
+                # in the order they were sent.
+                ranges = {0: full}
+                for index, track in enumerate(full.get("tracks") or []):
+                    ranges[index + 1] = track
+            except pipeline.AutoTrimError as exc:
+                logger.warning("Could not store the session's segment lists: %s", exc)
+
+        for index, video in enumerate(members):
+            if index >= len(tracks):
+                break
+            track = tracks[index]
+            # Every recording keeps its own copy of where it sits, how loud it was
+            # and how far it was moved, so its own page can say so.
+            video.sync_result = {
+                **(track.get("sync") or {}),
+                "role": track.get("role"),
+                "loudness_lufs": track.get("loudness_lufs"),
+                "gain_db": track.get("gain_db"),
+                "session_id": session.id,
+            }
+            if status.get("mode") == "trim" and track.get("output_path"):
+                video.trim_filename = _session_trim_name(video.id)
+                video.trim_result = {
+                    **{k: v for k, v in (result.items() if index == 0 else []) if k not in ("tracks", "segments")},
+                    **{k: v for k, v in track.items() if k != "waveform"},
+                    "waveform": track.get("waveform"),
+                    "output_filename": _session_trim_name(video.id),
+                    "session_id": session.id,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                stored = ranges.get(index) or {}
+                if stored.get("segments") is not None:
+                    video.trim_segments = stored["segments"]
+                if stored.get("timebase"):
+                    video.trim_result["timebase"] = stored["timebase"]
+
+    if session.job_id == status.get("job_id"):
+        session.job_id = None
+    db.commit()
+    db.refresh(session)
+    return status
+
+
+def _start_session_job(
+    session: models.SyncSession,
+    db: Session,
+    mode: str,
+    options: dict,
+) -> dict:
+    members = _session_members(session, db)
+    if len(members) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="A session needs at least two recordings to line up",
+        )
+    for video in members:
+        if not (VIDEOS_DIR / video.filename).exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f'The file for "{video.original_name}" is missing',
+            )
+
+    reference, others = members[0], members[1:]
+    if mode == "trim":
+        TRIMMED_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        status = pipeline.auto_trim_start(
+            str(VIDEOS_DIR / reference.filename),
+            mode=mode,
+            output_path=(
+                str(VIDEOS_DIR / _session_trim_name(reference.id)) if mode == "trim" else None
+            ),
+            others=[
+                {
+                    "video_path": str(VIDEOS_DIR / video.filename),
+                    "output_path": (
+                        str(VIDEOS_DIR / _session_trim_name(video.id))
+                        if mode == "trim"
+                        else None
+                    ),
+                }
+                for video in others
+            ],
+            **options,
+        )
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+    session.job_id = status.get("job_id")
+    if session.reference_video_id is None:
+        session.reference_video_id = reference.id
+    db.commit()
+    return status
+
+
+@app.get("/api/sessions")
+def list_sessions(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> List[dict]:
+    sessions = (
+        db.query(models.SyncSession)
+        .filter(models.SyncSession.owner_id == current_user.id)
+        .order_by(models.SyncSession.created_at.desc())
+        .all()
+    )
+    return [_session_payload(session, db) for session in sessions]
+
+
+@app.post("/api/sessions", status_code=201)
+def create_session(
+    payload: SyncSessionCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    session = models.SyncSession(
+        owner_id=current_user.id,
+        name=(payload.name or "").strip() or datetime.now().strftime("Session %Y-%m-%d %H:%M"),
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    if payload.video_ids:
+        _attach_videos(session, payload.video_ids, db, current_user)
+    return _session_payload(session, db)
+
+
+def _attach_videos(
+    session: models.SyncSession,
+    video_ids: List[int],
+    db: Session,
+    current_user: models.User,
+) -> None:
+    for video_id in video_ids:
+        video = _get_owned_video(video_id, db, current_user)
+        video.sync_session_id = session.id
+    if session.reference_video_id is None and video_ids:
+        session.reference_video_id = video_ids[0]
+    db.commit()
+
+
+@app.get("/api/sessions/{session_id}")
+def get_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    return _session_payload(_get_owned_session(session_id, db, current_user), db)
+
+
+@app.delete("/api/sessions/{session_id}", status_code=204)
+def delete_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Forget the session. The recordings and everything cut from them stay."""
+    session = _get_owned_session(session_id, db, current_user)
+    for video in _session_members(session, db):
+        video.sync_session_id = None
+    db.delete(session)
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.post("/api/sessions/{session_id}/videos")
+def add_session_videos(
+    session_id: int,
+    payload: SyncSessionMembers,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    session = _get_owned_session(session_id, db, current_user)
+    _attach_videos(session, payload.video_ids, db, current_user)
+    return _session_payload(session, db)
+
+
+@app.delete("/api/sessions/{session_id}/videos/{video_id}", status_code=204)
+def remove_session_video(
+    session_id: int,
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    session = _get_owned_session(session_id, db, current_user)
+    video = _get_owned_video(video_id, db, current_user)
+    if video.sync_session_id == session.id:
+        video.sync_session_id = None
+        video.sync_result = None
+    if session.reference_video_id == video.id:
+        # The clock the rest were placed against has left; the next recording
+        # takes over, and what was measured against the old one no longer means
+        # anything.
+        remaining = _session_members(session, db)
+        session.reference_video_id = remaining[0].id if remaining else None
+        session.result = None
+        for other in remaining:
+            other.sync_result = None
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.post("/api/sessions/{session_id}/reference/{video_id}")
+def set_session_reference(
+    session_id: int,
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Choose whose clock the session runs on."""
+    session = _get_owned_session(session_id, db, current_user)
+    video = _get_owned_video(video_id, db, current_user)
+    if video.sync_session_id != session.id:
+        raise HTTPException(status_code=400, detail="That recording is not in this session")
+    session.reference_video_id = video.id
+    # Offsets were measured against the old reference and mean nothing now.
+    session.result = None
+    for member in _session_members(session, db):
+        member.sync_result = None
+    db.commit()
+    return _session_payload(session, db)
+
+
+@app.post("/api/sessions/{session_id}/sync", status_code=202)
+def sync_session(
+    session_id: int,
+    payload: SessionSyncRequest = SessionSyncRequest(),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Level the recordings and work out where each one sits on the reference's
+    clock. Nothing is cut and no file is written."""
+    session = _get_owned_session(session_id, db, current_user)
+    return _start_session_job(session, db, "sync", {"check_drift": payload.check_drift})
+
+
+@app.post("/api/sessions/{session_id}/trim", status_code=202)
+def trim_session(
+    session_id: int,
+    payload: SyncSessionTrimRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Cut every recording in the session to one timeline."""
+    session = _get_owned_session(session_id, db, current_user)
+    return _start_session_job(
+        session,
+        db,
+        "trim",
+        {
+            **_auto_trim_edit_options(payload),
+            "crf": payload.crf,
+            "preset": payload.preset,
+            "normalize_audio": payload.normalize_audio,
+            "loudness_target": payload.loudness_target,
+            "edit_source": payload.edit_source,
+            "max_segments_returned": AUTO_TRIM_PREVIEW_SEGMENTS,
+        },
+    )
+
+
+@app.get("/api/sessions/{session_id}/job")
+def get_session_job(
+    session_id: int,
+    job_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    session = _get_owned_session(session_id, db, current_user)
+    wanted = job_id or session.job_id
+    if not wanted:
+        return {"state": "none", "job_id": None}
+
+    try:
+        status = pipeline.auto_trim_job(wanted)
+    except pipeline.AutoTrimError as exc:
+        if exc.status_code == 404:
+            if session.job_id == wanted:
+                session.job_id = None
+                db.commit()
+            return {"state": "expired", "job_id": wanted}
+        raise _auto_trim_failure(exc) from exc
+
+    return _reconcile_session_job(session, status, db)
+
+
+@app.delete("/api/sessions/{session_id}/job")
+def cancel_session_job(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    session = _get_owned_session(session_id, db, current_user)
+    if not session.job_id:
+        raise HTTPException(status_code=404, detail="Nothing is running for this session")
+    try:
+        status = pipeline.auto_trim_cancel(session.job_id)
+    except pipeline.AutoTrimError as exc:
+        if exc.status_code == 404:
+            session.job_id = None
+            db.commit()
+            return {"state": "expired", "job_id": None}
+        raise _auto_trim_failure(exc) from exc
+    session.job_id = None
+    db.commit()
+    return status
+
 
 # An editor export needs the source's shape as well as the cut list, so both
 # endpoints read the same fields out of what the render recorded.

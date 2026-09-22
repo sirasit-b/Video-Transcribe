@@ -3,7 +3,7 @@
 import { usePathname, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect } from "react";
-import { Video, LogOut, Users, LayoutDashboard, Loader2 } from "lucide-react";
+import { Layers, LayoutDashboard, Loader2, LogOut, Users, Video } from "lucide-react";
 import { useAuth } from "../lib/auth-context";
 
 const PUBLIC_ROUTES = ["/login", "/register", "/reset-password"];
@@ -52,6 +52,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <span className="text-lg font-semibold tracking-tight">Video Transcribe</span>
         </Link>
         <div className="flex items-center gap-3 text-sm">
+          <Link
+            href="/sessions"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors ${
+              pathname.startsWith("/sessions")
+                ? "bg-gray-100 text-gray-900"
+                : "text-gray-500 hover:bg-gray-50 hover:text-gray-900"
+            }`}
+          >
+            <Layers className="w-4 h-4" strokeWidth={1.5} />
+            หลายกล้อง
+          </Link>
           {/* ลิงก์ "ระบบคำ" ถูกซ่อนออกจากเมนูนี้ตามคำขอ — หน้า /glossary ยังใช้งานได้
               ตามปกติผ่านลิงก์อื่นในแอป (เช่นในรายงานการขัดคำ) หรือเข้า URL ตรง ๆ */}
           {user.role === "admin" && (
