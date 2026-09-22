@@ -21,6 +21,7 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 |-- pipeline.py             # Audio extraction, transcription, SRT/VTT captions, frame extraction adapter
 |-- glossary.py             # The word system: ASR error rules + one-pass corrector
 |-- caption_polish.py       # Line splitting, spacing repair, timestamp sanitising
+|-- fcpxml.py               # Final Cut Pro XML for an auto-trimmed edit
 |-- pricing.py              # Per-run time and cost estimates
 |-- docker-compose.yml      # Multi-service local stack
 |-- docker-compose.vaapi.yml   # Overlay: pass an Intel/AMD GPU to the trim service
@@ -39,6 +40,8 @@ Full-stack video service for uploading videos, generating Thai transcripts with 
 - Stream uploaded videos
 - Extract evenly spaced frames from videos
 - Cut the silent parts out of a video with one button, using auto-editor's edit decision
+- See the loudness envelope before and after the cut, and export the edit as a
+  Final Cut Pro project (FCPXML) that still points at the original footage
 - Transcribe video audio to Thai text with per-segment timestamps, choosing the model per run
 - See the projected time and cost *before* transcribing, and the actual figures after
 - Fix ASR errors from a persistent word system in a single pass, with every change highlighted
@@ -149,6 +152,7 @@ Base URL: `http://localhost:8734`
 - `POST /api/videos/{video_id}/auto-trim` - start the render of the video without its silent parts
 - `GET /api/videos/{video_id}/auto-trim/job` - phase, progress and ETA of that job
 - `DELETE /api/videos/{video_id}/auto-trim/job` - cancel it, killing the encodes
+- `GET /api/videos/{video_id}/auto-trim/fcpxml?media_path=&version=11` - the edit as a Final Cut Pro project
 - `GET /api/videos/{video_id}/trimmed?download=1` - stream or download the trimmed render
 - `DELETE /api/videos/{video_id}/trimmed` - discard the trimmed render
 - `GET /api/transcribe-models` - transcription models the UI can offer, with per-minute cost
@@ -241,6 +245,45 @@ which makes it an upper bound; the UI passes the share a preview measured to sha
 it. The rates behind it (audio analysis, pixels per second, audio encoding)
 calibrate themselves from every run, so the numbers fit the machine rather than a
 guess baked into the code.
+
+### Seeing the cut
+
+The panel draws the loudness envelope twice: **ก่อนตัด**, the whole timeline with
+the parts that will go shaded red and the threshold marked, and **หลังตัด**, what
+the trimmed file sounds like end to end. Clicking either one seeks the matching
+player, so a suspicious cut can be listened to before committing to it.
+
+The drawing comes from the same levels the edit is decided from — summarised to
+1200 buckets, peak per bucket (an average would smear a quiet gap into the speech
+beside it, hiding exactly the distinction being shown). Alongside it the service
+sends how much of each bucket survives, which is what the red bands are drawn
+from: 1.2 kB whether the edit has four cuts or four thousand, so the picture is
+still there after a reload without keeping a segment list in the row.
+
+### Exporting to Final Cut Pro
+
+**FCPXML** next to the video download hands the edit to an editor:
+`GET /api/videos/{id}/auto-trim/fcpxml`.
+
+The XML references the **original** upload, not the trimmed render, so Final Cut
+opens a project whose cuts are already made but still adjustable — which is the
+point of taking an edit into an editor at all. Each kept range becomes one
+`asset-clip` on the spine, carrying the source's picture and audio together.
+
+Times are written as rationals with the timeline's own denominator
+(`{frames × 1001}/30000s` for 29.97), because decimals are what make an imported
+timeline drift off the frame the edit chose.
+
+Final Cut relinks media it cannot find, so the file imports as-is and asks where
+the footage lives. Filling in the footage folder next to the button (or
+`?media_path=/Volumes/Work/footage`) spares that step. `?version=10` writes FCPXML
+1.10 for older Final Cut versions.
+
+[`fcpxml.py`](fcpxml.py) is shaped after auto-editor's `src/exports/fcp11.nim`,
+which is the reference for what Final Cut actually accepts, and
+[`test_fcpxml.py`](test_fcpxml.py) covers the parts that fail silently: frame
+rationals, clips sitting end to end, NTSC denominators, Thai filenames as both URL
+and XML.
 
 ### The edit decision is auto-editor's
 
@@ -459,6 +502,8 @@ render untouched.
 
 Captions are not re-timed against the cut. The trimmed render and the transcript of
 the original no longer line up, so transcribe *after* trimming if you need both.
+(The FCPXML export has the same boundary: it carries picture and audio, not
+subtitles.)
 
 ## Caption Clean-up
 

@@ -55,10 +55,14 @@ class Video(Base):
     # than in the request that started it, so a reload (or another uvicorn worker)
     # can pick the polling back up and file the result.
     trim_job_id = Column(String, nullable=True)
-    # What that trim cut: durations, frame counts, settings and timings. The
-    # segment list is left out on purpose — it is large, and every video load
-    # would carry it; re-run the preview to get the ranges back.
+    # What that trim cut: durations, frame counts, settings, timings, and the
+    # loudness envelope before and after (downsampled, so the panel can draw it
+    # without re-analyzing). The segment list is kept separately.
     trim_result = Column(JSON, nullable=True)
+    # Every kept range of the last trim, on the timeline's own timebase. Large
+    # enough to be worth keeping out of VideoResponse, and only read when an edit
+    # is exported to an editor.
+    trim_segments = Column(JSON, nullable=True)
     is_deleted = Column(Boolean, nullable=False, default=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

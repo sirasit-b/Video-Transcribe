@@ -104,6 +104,13 @@ struct EditRequest {
     /// describe the whole edit.
     #[serde(default)]
     max_segments_returned: Option<usize>,
+    /// How many buckets the waveform is summarised into. 0 leaves it out.
+    #[serde(default = "default_waveform_buckets")]
+    waveform_buckets: usize,
+}
+
+fn default_waveform_buckets() -> usize {
+    1200
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -158,6 +165,24 @@ struct Segment {
     end: f64,
 }
 
+/// The loudness envelope, before and after the cut, summarised to something a
+/// browser can draw. Peak per bucket rather than an average: an average smears
+/// the quiet gaps into the speech around them, which is exactly the distinction
+/// the picture is meant to show.
+#[derive(Serialize)]
+struct Waveform {
+    buckets: usize,
+    /// Over the whole timeline.
+    before: Vec<u8>,
+    /// Over the kept frames only, so it lines up with the trimmed file.
+    after: Vec<u8>,
+    /// How much of each bucket survives the edit, 0 to 255. Bucket resolution is
+    /// all a drawing needs, and unlike the segment list it stays the same 1.2 kB
+    /// whether the edit has four cuts or four thousand — so the picture still
+    /// draws after a reload, from what the render stored.
+    kept: Vec<u8>,
+}
+
 #[derive(Serialize)]
 struct Analysis {
     timebase: Rational,
@@ -172,6 +197,13 @@ struct Analysis {
     mincut_frames: i64,
     minclip_frames: i64,
     audio_streams: usize,
+    /// Source shape, carried through so an edit can be exported to an editor
+    /// (FCPXML needs the picture size and the audio layout).
+    has_video: bool,
+    width: u32,
+    height: u32,
+    sample_rate: u32,
+    channels: usize,
     total_frames: usize,
     kept_frames: usize,
     removed_frames: usize,
@@ -186,6 +218,7 @@ struct Analysis {
     segment_count: usize,
     segments: Vec<Segment>,
     segments_truncated: bool,
+    waveform: Option<Waveform>,
     analyze_seconds: f64,
 }
 
@@ -449,6 +482,7 @@ async fn main() {
         .route("/estimate", post(estimate))
         .route("/jobs", post(start_job))
         .route("/jobs/:job_id", get(job_status))
+        .route("/jobs/:job_id/segments", get(job_segments))
         .route("/jobs/:job_id", delete(cancel_job))
         .with_state(state);
 
@@ -577,6 +611,30 @@ async fn job_status(
         .get(&job_id)
         .ok_or((StatusCode::NOT_FOUND, "no such job".to_string()))?;
     Ok(Json(status_of(&job)))
+}
+
+/// Every kept range of a finished job, uncapped.
+///
+/// The status response caps its segment list, because a poll every second should
+/// not carry a megabyte of ranges. An export needs all of them, and asks once.
+async fn job_segments(
+    State(state): State<Arc<AppState>>,
+    UrlPath(job_id): UrlPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let job = state
+        .jobs
+        .get(&job_id)
+        .ok_or((StatusCode::NOT_FOUND, "no such job".to_string()))?;
+    let segments = job
+        .segments
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "this job has not finished its analysis".to_string(),
+        ))?;
+    Ok(Json(segments))
 }
 
 async fn cancel_job(
@@ -715,6 +773,53 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
 // The work
 // ---------------------------------------------------------------------------
 
+/// The loudest level in each bucket, as a byte. Peaks are what a waveform is
+/// made of; averaging would hide the quiet frames the edit turns on.
+fn peaks(levels: &[u16], buckets: usize) -> Vec<u8> {
+    if levels.is_empty() || buckets == 0 {
+        return Vec::new();
+    }
+    let buckets = buckets.min(levels.len());
+    let mut out = Vec::with_capacity(buckets);
+    for bucket in 0..buckets {
+        let start = bucket * levels.len() / buckets;
+        let end = (((bucket + 1) * levels.len() / buckets).max(start + 1)).min(levels.len());
+        let peak = levels[start..end].iter().copied().max().unwrap_or(0);
+        out.push((peak >> 8) as u8);
+    }
+    out
+}
+
+/// The share of each bucket the edit keeps, on the same buckets as `peaks`.
+fn kept_share(mask: &[bool], buckets: usize) -> Vec<u8> {
+    if mask.is_empty() || buckets == 0 {
+        return Vec::new();
+    }
+    let buckets = buckets.min(mask.len());
+    let mut out = Vec::with_capacity(buckets);
+    for bucket in 0..buckets {
+        let start = bucket * mask.len() / buckets;
+        let end = (((bucket + 1) * mask.len() / buckets).max(start + 1)).min(mask.len());
+        let kept = mask[start..end].iter().filter(|&&keep| keep).count();
+        out.push((kept * 255 / (end - start)) as u8);
+    }
+    out
+}
+
+/// One envelope for the whole file, loudest stream winning per frame — the same
+/// "any stream is loud enough" rule the edit itself uses.
+fn combined_levels(streams: &[audio::StreamAnalysis], total_frames: usize) -> Vec<u16> {
+    let mut levels = vec![0u16; total_frames];
+    for stream in streams {
+        for (index, &level) in stream.levels.iter().enumerate() {
+            if level > levels[index] {
+                levels[index] = level;
+            }
+        }
+    }
+    levels
+}
+
 /// Frames for a duration in seconds, the way auto-editor converts `--margin` and
 /// `--smooth`: the requested length scaled by the timebase, then rounded.
 fn to_frames(seconds: f64, timebase: f64) -> i64 {
@@ -827,6 +932,24 @@ fn analyze(
     let removed_frames = total_frames - kept_frames;
 
     let limit = request.max_segments_returned.unwrap_or(usize::MAX);
+
+    let waveform = if request.waveform_buckets > 0 {
+        let levels = combined_levels(&streams, total_frames);
+        let kept: Vec<u16> = segments
+            .iter()
+            .flat_map(|&(start, end)| levels[start..end].iter().copied())
+            .collect();
+        let before = peaks(&levels, request.waveform_buckets);
+        Some(Waveform {
+            buckets: before.len(),
+            kept: kept_share(&active, request.waveform_buckets),
+            before,
+            after: peaks(&kept, request.waveform_buckets),
+        })
+    } else {
+        None
+    };
+
     let analysis = Analysis {
         timebase: source.timebase,
         fps: timebase,
@@ -840,6 +963,11 @@ fn analyze(
         mincut_frames: smooth_frames.0,
         minclip_frames: smooth_frames.1,
         audio_streams: streams.len(),
+        has_video: source.info.has_video,
+        width: source.info.width,
+        height: source.info.height,
+        sample_rate: source.info.audio.first().map(|a| a.sample_rate).unwrap_or(0),
+        channels: source.info.audio.first().map(|a| a.channels).unwrap_or(0),
         total_frames,
         kept_frames,
         removed_frames,
@@ -864,6 +992,7 @@ fn analyze(
             })
             .collect(),
         segments_truncated: segments.len() > limit,
+        waveform,
         analyze_seconds: round2(started.elapsed().as_secs_f64()),
     };
 
@@ -895,6 +1024,24 @@ fn run_job(
         .map_err(|err| WorkError::Failed(err.to_string()))?;
     if let Ok(mut slot) = job.analysis.lock() {
         *slot = Some(analysis_value.clone());
+    }
+    if let Ok(mut slot) = job.segments.lock() {
+        let timebase = source.timebase.as_f64();
+        *slot = Some(json!({
+            "timebase": {"num": source.timebase.num, "den": source.timebase.den},
+            "fps": timebase,
+            "segment_count": decision.segments.len(),
+            "segments": decision
+                .segments
+                .iter()
+                .map(|&(start, end)| json!({
+                    "start_frame": start,
+                    "end_frame": end,
+                    "start": start as f64 / timebase,
+                    "end": end as f64 / timebase,
+                }))
+                .collect::<Vec<_>>(),
+        }));
     }
 
     let output = match output {
@@ -1328,6 +1475,48 @@ mod tests {
             }],
             duration,
         }
+    }
+
+    #[test]
+    fn a_waveform_keeps_the_peak_of_each_bucket() {
+        // Averaging would smear a quiet gap into the speech beside it; the peak is
+        // what shows where the edit will cut.
+        let levels: Vec<u16> = vec![0, 0, 60000, 0, 100, 200, 0, 0];
+        let drawn = peaks(&levels, 4);
+        assert_eq!(drawn, vec![0, 234, 0, 0]);
+        assert_eq!(drawn.len(), 4);
+    }
+
+    #[test]
+    fn a_waveform_never_invents_buckets() {
+        // Fewer frames than buckets: one bucket per frame, not padding.
+        assert_eq!(peaks(&[65535, 0, 65535], 100).len(), 3);
+        assert!(peaks(&[], 100).is_empty());
+        assert!(peaks(&[1, 2, 3], 0).is_empty());
+    }
+
+    #[test]
+    fn the_kept_share_says_how_much_of_each_bucket_survives() {
+        // Four frames per bucket: all kept, none kept, half kept.
+        let mask = [true, true, true, true, false, false, false, false, true, true, false, false];
+        assert_eq!(kept_share(&mask, 3), vec![255, 0, 127]);
+        assert!(kept_share(&[], 10).is_empty());
+        assert!(kept_share(&[true], 0).is_empty());
+    }
+
+    #[test]
+    fn the_envelope_takes_the_loudest_stream_per_frame() {
+        // The edit keeps a frame if *any* stream is loud enough, so the drawing
+        // has to agree with it.
+        let quiet = audio::StreamAnalysis {
+            levels: vec![10, 20, 30],
+            boundaries: vec![0, 1, 2, 3],
+        };
+        let loud = audio::StreamAnalysis {
+            levels: vec![5, 900, 0],
+            boundaries: vec![0, 1, 2, 3],
+        };
+        assert_eq!(combined_levels(&[quiet, loud], 3), vec![10, 900, 30]);
     }
 
     #[test]

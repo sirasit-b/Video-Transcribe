@@ -238,6 +238,8 @@ pub struct Job {
     /// The edit decision, published as soon as the analysis phase ends so the UI
     /// can show what will be cut while the render is still running.
     pub analysis: Mutex<Option<serde_json::Value>>,
+    /// Every kept range, uncapped, for an export to ask for once.
+    pub segments: Mutex<Option<serde_json::Value>>,
     canceled: AtomicBool,
     children: Mutex<Vec<Arc<Mutex<Child>>>>,
     outcome: Mutex<Option<Outcome>>,
@@ -381,6 +383,7 @@ impl Jobs {
             progress: Progress::default(),
             estimate: Mutex::new(None),
             analysis: Mutex::new(None),
+            segments: Mutex::new(None),
             canceled: AtomicBool::new(false),
             children: Mutex::new(Vec::new()),
             outcome: Mutex::new(None),
