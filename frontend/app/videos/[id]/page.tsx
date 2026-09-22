@@ -362,6 +362,7 @@ interface FrameItem {
 }
 
 const MODEL_KEY = "vt_transcribe_model";
+const MEDIA_PATH_KEY = "vt_trim_media_path";
 
 const TRIM_PHASE_LABELS: Record<string, string> = {
   queued: "เข้าคิว",
@@ -433,8 +434,11 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   const [startingTrim, setStartingTrim] = useState<"analyze" | "trim" | null>(null);
   const [isCancelingTrim, setIsCancelingTrim] = useState(false);
   const [isDeletingTrim, setIsDeletingTrim] = useState(false);
-  // Where the footage lives on the editing machine. Optional: without it Final
-  // Cut imports the project and asks to relink.
+  // How the exports should point at the footage. "beside" writes a relative
+  // reference that the editor resolves against the folder the XML is in, which is
+  // the whole configuration most people need; "path" writes an absolute one for
+  // footage that lives somewhere known on the editing machine.
+  const [trimMediaMode, setTrimMediaMode] = useState<"beside" | "path">("beside");
   const [trimMediaPath, setTrimMediaPath] = useState("");
   // Bumped after each render so the player reloads instead of showing the
   // previous trim from cache at the same URL.
@@ -492,6 +496,21 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     });
     if (start !== null) bands.push({ x: start * step, width: (kept.length - start) * step });
     return bands;
+  })();
+
+  // Only an absolute folder goes on the query; left out, the export writes a
+  // reference relative to the XML itself.
+  const trimMediaQuery =
+    trimMediaMode === "path" && trimMediaPath.trim()
+      ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
+      : "";
+  // What the export will actually say, so it is not a mystery until it fails.
+  const trimMediaReference = (() => {
+    const name = video?.original_name?.split(/[\\/]/).pop() || "source.mp4";
+    if (trimMediaMode === "path" && trimMediaPath.trim()) {
+      return `${trimMediaPath.trim().replace(/\/$/, "")}/${name}`;
+    }
+    return name;
   })();
 
   const captionSegments = video?.caption_segments ?? [];
@@ -893,7 +912,15 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     (async () => {
       try {
         const res = await api.get<TrimCapabilities>(`/auto-trim/capabilities`);
-        if (active) setTrimCapabilities(res.data);
+        if (!active) return;
+        setTrimCapabilities(res.data);
+        // Read after the await, so the first render matches the server's and the
+        // folder someone typed last time is still there.
+        const stored = localStorage.getItem(MEDIA_PATH_KEY);
+        if (stored) {
+          setTrimMediaPath(stored);
+          setTrimMediaMode("path");
+        }
       } catch (err) {
         // Only decoration for the panel; a service that cannot answer will say so
         // through the estimate instead.
@@ -2065,11 +2092,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                 </a>
                 <a
                   href={withAuthToken(
-                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/fcpxml${
-                      trimMediaPath.trim()
-                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
-                        : ""
-                    }`
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/fcpxml${trimMediaQuery}`
                   )}
                   title="โปรเจกต์ Final Cut Pro (10.6.8+) ที่อ้างถึงไฟล์ต้นฉบับ — รอยตัดมาครบและยังขยับได้"
                   className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
@@ -2079,11 +2102,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                 </a>
                 <a
                   href={withAuthToken(
-                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/xml${
-                      trimMediaPath.trim()
-                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
-                        : ""
-                    }`
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/xml${trimMediaQuery}`
                   )}
                   title="XML แบบ Final Cut Pro 7 — Premiere Pro, DaVinci Resolve และ FCP 7 อ่านได้"
                   className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
@@ -2093,11 +2112,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                 </a>
                 <a
                   href={withAuthToken(
-                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/json${
-                      trimMediaPath.trim()
-                        ? `?media_path=${encodeURIComponent(trimMediaPath.trim())}`
-                        : ""
-                    }`
+                    `${MEDIA_BASE}/api/videos/${videoId}/auto-trim/json${trimMediaQuery}`
                   )}
                   title="Timeline ของ auto-editor — เอากลับไปเรนเดอร์ซ้ำหรืออ่านด้วยสคริปต์ได้ (auto-editor timeline.json -o out.mp4)"
                   className="flex items-center gap-2 border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-gray-50 transition-colors"
@@ -2118,13 +2133,38 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                   ลบไฟล์ที่ตัด
                 </button>
               </div>
-              <input
-                value={trimMediaPath}
-                onChange={(e) => setTrimMediaPath(e.target.value)}
-                placeholder="โฟลเดอร์ฟุตเทจบนเครื่องตัดต่อ (ไม่ใส่ก็ได้)"
-                title="ใส่ path ที่ไฟล์ต้นฉบับอยู่บนเครื่อง Mac เช่น /Volumes/Work/footage แล้ว Final Cut จะหาไฟล์เจอเองโดยไม่ต้อง relink"
-                className="w-full border border-gray-200 rounded-lg px-3 py-1.5 text-[11px] text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
-              />
+              {/* Where the exports say the footage is. Getting this wrong is what
+                  makes an editor report missing media, so it says what it will write. */}
+              <div className="flex flex-col gap-1.5 pt-1">
+                <select
+                  value={trimMediaMode}
+                  onChange={(e) => {
+                    const mode = e.target.value as "beside" | "path";
+                    setTrimMediaMode(mode);
+                    if (mode === "beside") localStorage.removeItem(MEDIA_PATH_KEY);
+                  }}
+                  aria-label="ตำแหน่งไฟล์ต้นฉบับสำหรับไฟล์ export"
+                  className="border border-gray-200 rounded-lg px-2 py-1.5 text-[11px] text-gray-700 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+                >
+                  <option value="beside">วางไฟล์ export ไว้โฟลเดอร์เดียวกับวิดีโอต้นฉบับ (แนะนำ)</option>
+                  <option value="path">ระบุโฟลเดอร์ของวิดีโอต้นฉบับบนเครื่องตัดต่อ</option>
+                </select>
+                {trimMediaMode === "path" && (
+                  <input
+                    value={trimMediaPath}
+                    onChange={(e) => {
+                      setTrimMediaPath(e.target.value);
+                      localStorage.setItem(MEDIA_PATH_KEY, e.target.value);
+                    }}
+                    placeholder="/Users/you/Movies/footage"
+                    className="border border-gray-200 rounded-lg px-3 py-1.5 text-[11px] text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+                  />
+                )}
+                <p className="text-[11px] text-gray-400 break-all">
+                  ไฟล์ export จะอ้างวิดีโอว่า <span className="font-mono text-gray-500">{trimMediaReference}</span>
+                  {trimMediaMode === "beside" ? " — ดาวน์โหลดไปไว้ข้างไฟล์วิดีโอแล้วเปิดได้เลย" : ""}
+                </p>
+              </div>
             </div>
           </div>
         )}

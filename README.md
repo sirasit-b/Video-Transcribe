@@ -290,9 +290,27 @@ The two count time differently, and both have a trap:
   one audio track per channel, each clip linked to its picture so they move
   together, which is what Premiere expects.
 
-Editors relink media they cannot find, so both files import as-is and ask where the
-footage lives. Filling in the footage folder next to the buttons (or
-`?media_path=/Volumes/Work/footage`) spares that step.
+### Where the exports say the footage is
+
+By default every export references the footage by **name only** — a relative URL,
+which the editor resolves against the folder the document itself is in. Download
+the XML beside the original video and it links with nothing to do.
+
+This started out writing `file:///C6176.MP4` when no folder was given, which is the
+root of the disk and therefore never exists: Final Cut on macOS reported missing
+media every time. A relative reference is the sane default; an absolute one is for
+footage that lives somewhere known.
+
+The picker under the export buttons chooses between the two and shows what will be
+written, because getting it wrong is exactly what makes an editor ask for the file:
+
+| Choice | The document says | Use when |
+|---|---|---|
+| วางไฟล์ export ไว้โฟลเดอร์เดียวกับวิดีโอต้นฉบับ (default) | `C6176.MP4` | the XML and the footage end up in one folder |
+| ระบุโฟลเดอร์ | `file:///Users/you/Movies/raw/C6176.MP4` | the footage has a fixed home on the editing machine |
+
+The folder is remembered in the browser, so it is typed once. On the API it is
+`?media_path=/Users/you/Movies/raw`, and it applies to all three exports.
 
 [`fcpxml.py`](fcpxml.py) writes both, shaped after auto-editor's
 `src/exports/fcp11.nim` and `src/exports/fcp7.nim` — the reference for what these
