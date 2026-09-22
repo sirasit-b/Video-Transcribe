@@ -24,3 +24,7 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Reference clone of auto-editor, kept for comparing the edit decision.
+# It has its own .git; nothing here should end up in this repo.
+/auto-editor/

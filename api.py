@@ -7,6 +7,7 @@ import io
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, UploadFile, File
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -81,6 +82,15 @@ def init_database():
                 conn.execute(
                     text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS rewrite_stats JSONB")
                 )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS trim_filename VARCHAR")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS trim_result JSONB")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS trim_job_id VARCHAR")
+                )
                 position_exists = conn.execute(
                     text(
                         "SELECT 1 FROM information_schema.columns "
@@ -133,6 +143,9 @@ app.add_middleware(
 VIDEOS_DIR = Path("videos")
 TEXTS_DIR = Path("texts")
 FRAMES_DIR = Path("frames")
+# Auto-trimmed renders live in a subdirectory of the uploads, so they share the
+# volume the trim service reads from without ever colliding with an upload's name.
+TRIMMED_DIR = VIDEOS_DIR / "trimmed"
 VIDEOS_DIR.mkdir(exist_ok=True)
 TEXTS_DIR.mkdir(exist_ok=True)
 FRAMES_DIR.mkdir(exist_ok=True)
@@ -220,6 +233,9 @@ class VideoResponse(BaseModel):
     transcribe_stats: Optional[dict] = None
     polish_report: Optional[dict] = None
     rewrite_stats: Optional[dict] = None
+    trim_filename: Optional[str] = None
+    trim_result: Optional[dict] = None
+    trim_job_id: Optional[str] = None
     project_id: Optional[int] = None
     created_at: datetime
 
@@ -356,6 +372,23 @@ class FrameExtractionResponse(BaseModel):
     video_id: int
     count: int
     frames: List[FrameResponse]
+
+class AutoTrimRequest(BaseModel):
+    """Settings for one auto trim run.
+
+    Every field is optional: an unset field is left to the auto-trim service, which
+    applies auto-editor's own defaults (4% threshold, 0.2s margins, 0.2s mincut,
+    0.1s minclip). `threshold` is a fraction of full scale, the rest are seconds.
+    """
+
+    threshold: Optional[float] = None
+    margin_start: Optional[float] = None
+    margin_end: Optional[float] = None
+    mincut: Optional[float] = None
+    minclip: Optional[float] = None
+    # Encoder knobs for the render; ignored by the preview.
+    crf: Optional[int] = None
+    preset: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Auth & user management
@@ -909,6 +942,278 @@ def get_video_frame(
     if not frame_path.exists() or not frame_path.is_file():
         raise HTTPException(status_code=404, detail="Frame not found")
     return FileResponse(frame_path)
+
+# ---------------------------------------------------------------------------
+# Auto trim: cut the silent parts out of a video
+# ---------------------------------------------------------------------------
+# A three-hour video takes minutes to analyze and render, so a trim is a job: the
+# service starts the work and answers with an id, and the UI polls
+# `/auto-trim/job` for phase, progress and ETA. The id is kept on the video row, so
+# a reload — or another uvicorn worker — can pick the polling back up.
+#
+# The preview's segment list is only there for the UI to show and count, so it is
+# capped. A cut this fine-grained is already past the point of being reviewable.
+AUTO_TRIM_PREVIEW_SEGMENTS = 2000
+
+def _auto_trim_edit_options(payload: AutoTrimRequest) -> dict:
+    """Just the editing settings; unset ones fall through to the service defaults."""
+    return {
+        "threshold": payload.threshold,
+        "margin_start": payload.margin_start,
+        "margin_end": payload.margin_end,
+        "mincut": payload.mincut,
+        "minclip": payload.minclip,
+    }
+
+def _auto_trim_source(video: models.Video) -> Path:
+    file_path = VIDEOS_DIR / video.filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+    return file_path
+
+def _auto_trim_failure(exc: pipeline.AutoTrimError) -> HTTPException:
+    """Pass the service's own status through, so a 4xx keeps its real reason."""
+    status = exc.status_code if 400 <= exc.status_code < 600 else 502
+    if status >= 500:
+        logger.error("Auto trim failed: %s", exc)
+    return HTTPException(status_code=status, detail=str(exc))
+
+def _trimmed_path(video: models.Video) -> Optional[Path]:
+    """This video's trimmed render on disk, or None if there isn't one."""
+    if not video.trim_filename:
+        return None
+    # We wrote this value, but resolve it anyway: a stray row must not be able to
+    # serve a file from outside the uploads directory.
+    candidate = (VIDEOS_DIR / video.trim_filename).resolve()
+    if not candidate.is_relative_to(VIDEOS_DIR.resolve()):
+        return None
+    return candidate if candidate.is_file() else None
+
+def _attachment_headers(filename: str) -> dict:
+    """A Content-Disposition that survives a Thai filename.
+
+    Headers are latin-1, so the plain `filename` is an ASCII-folded version and the
+    real name rides along in RFC 5987 form for clients that read it.
+    """
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("_") or "video.mp4"
+    encoded = quote(filename)
+    return {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
+        )
+    }
+
+def _trim_output_name(video_id: int) -> str:
+    return f"trimmed/video_{video_id}.mp4"
+
+def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
+    """Record a finished trim on the video row.
+
+    Polling is what commits a result, so a render survives a browser that was closed
+    halfway through it: the job id stays on the row and the next poll — from any
+    worker, on any page load — files the outcome. The service keeps finished jobs
+    around for a while, which is what makes that late poll possible.
+    """
+    state = status.get("state")
+    if state not in ("done", "failed", "canceled"):
+        return status
+
+    if state == "done" and status.get("mode") == "trim":
+        result = status.get("result") or {}
+        # Keep the summary, drop the segment list (see models.Video.trim_result).
+        summary = {key: value for key, value in result.items() if key != "segments"}
+        summary.update(
+            {
+                "output_filename": _trim_output_name(video.id),
+                "elapsed_seconds": round(status.get("elapsed_seconds") or 0.0, 2),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        video.trim_filename = _trim_output_name(video.id)
+        video.trim_result = summary
+
+    # A failed or cancelled run leaves any previous render untouched; only the
+    # pointer to the job goes away.
+    if video.trim_job_id == status.get("job_id"):
+        video.trim_job_id = None
+    db.commit()
+    db.refresh(video)
+    return status
+
+@app.get("/api/auto-trim/capabilities")
+def auto_trim_capabilities(
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """What the trim service can encode with: the CPU it sees, the GPU devices in
+    its container, and every encoder it tried on the way to choosing one."""
+    try:
+        return pipeline.auto_trim_capabilities()
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+@app.get("/api/videos/{video_id}/auto-trim/estimate")
+def estimate_auto_trim(
+    video_id: int,
+    kept_ratio: Optional[float] = Query(None, ge=0.0, le=1.0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """How long a trim would take, from the file's shape alone.
+
+    Nothing is decoded, so this is instant. Without `kept_ratio` the figure assumes
+    the whole video survives the edit, which makes it an upper bound; pass the share
+    a preview measured to sharpen it.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    source = _auto_trim_source(video)
+
+    try:
+        return pipeline.auto_trim_estimate(str(source), assumed_kept_ratio=kept_ratio)
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+@app.post("/api/videos/{video_id}/auto-trim/preview", status_code=202)
+def preview_auto_trim(
+    video_id: int,
+    payload: AutoTrimRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Start an analyze-only job: what would be cut, without the encode time."""
+    video = _get_owned_video(video_id, db, current_user)
+    source = _auto_trim_source(video)
+
+    try:
+        status = pipeline.auto_trim_start(
+            str(source),
+            mode="analyze",
+            **_auto_trim_edit_options(payload),
+            max_segments_returned=AUTO_TRIM_PREVIEW_SEGMENTS,
+        )
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+    video.trim_job_id = status.get("job_id")
+    db.commit()
+    return status
+
+@app.post("/api/videos/{video_id}/auto-trim", status_code=202)
+def auto_trim_video(
+    video_id: int,
+    payload: AutoTrimRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Start the render of this video with its silent parts removed.
+
+    The source upload is never touched: the cut is a separate file, so a trim can be
+    re-run with other settings, or thrown away, without losing the original.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    source = _auto_trim_source(video)
+    TRIMMED_DIR.mkdir(parents=True, exist_ok=True)
+
+    try:
+        status = pipeline.auto_trim_start(
+            str(source),
+            mode="trim",
+            output_path=str(VIDEOS_DIR / _trim_output_name(video_id)),
+            **_auto_trim_edit_options(payload),
+            crf=payload.crf,
+            preset=payload.preset,
+            max_segments_returned=AUTO_TRIM_PREVIEW_SEGMENTS,
+        )
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+    video.trim_job_id = status.get("job_id")
+    db.commit()
+    return status
+
+@app.get("/api/videos/{video_id}/auto-trim/job")
+def get_auto_trim_job(
+    video_id: int,
+    job_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Phase, progress and ETA of this video's trim job."""
+    video = _get_owned_video(video_id, db, current_user)
+    wanted = job_id or video.trim_job_id
+    if not wanted:
+        return {"state": "none", "job_id": None}
+
+    try:
+        status = pipeline.auto_trim_job(wanted)
+    except pipeline.AutoTrimError as exc:
+        # The service forgets a job eventually, and loses them all on restart.
+        # Nothing is running, which is an answer rather than an error.
+        if exc.status_code == 404:
+            if video.trim_job_id == wanted:
+                video.trim_job_id = None
+                db.commit()
+            return {"state": "expired", "job_id": wanted}
+        raise _auto_trim_failure(exc) from exc
+
+    return _reconcile_trim_job(video, status, db)
+
+@app.delete("/api/videos/{video_id}/auto-trim/job")
+def cancel_auto_trim_job(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Stop this video's trim job and kill the encodes it has running."""
+    video = _get_owned_video(video_id, db, current_user)
+    if not video.trim_job_id:
+        raise HTTPException(status_code=404, detail="No auto trim job is running")
+
+    try:
+        status = pipeline.auto_trim_cancel(video.trim_job_id)
+    except pipeline.AutoTrimError as exc:
+        if exc.status_code == 404:
+            video.trim_job_id = None
+            db.commit()
+            return {"state": "expired", "job_id": None}
+        raise _auto_trim_failure(exc) from exc
+
+    video.trim_job_id = None
+    db.commit()
+    return status
+
+@app.get("/api/videos/{video_id}/trimmed")
+def stream_trimmed_video(
+    video_id: int,
+    download: bool = False,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user_for_media),
+):
+    video = _get_owned_video(video_id, db, current_user)
+    trimmed = _trimmed_path(video)
+    if trimmed is None:
+        raise HTTPException(status_code=404, detail="No trimmed video available")
+
+    headers = None
+    if download:
+        base = Path(video.original_name).stem or f"video_{video_id}"
+        headers = _attachment_headers(f"{base}_trimmed.mp4")
+    return FileResponse(trimmed, media_type="video/mp4", headers=headers)
+
+@app.delete("/api/videos/{video_id}/trimmed", status_code=204)
+def delete_trimmed_video(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    video = _get_owned_video(video_id, db, current_user)
+    trimmed = _trimmed_path(video)
+    if trimmed is not None:
+        trimmed.unlink(missing_ok=True)
+
+    video.trim_filename = None
+    video.trim_result = None
+    db.commit()
+    return Response(status_code=204)
 
 @app.get("/api/videos/{video_id}/captions.vtt")
 def get_video_captions_vtt(

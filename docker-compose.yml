@@ -30,6 +30,26 @@ services:
       - frames_data:/app/frames
     restart: unless-stopped
 
+  auto-trim:
+    build:
+      context: ./auto-trim-rs
+      dockerfile: Dockerfile
+    container_name: borntodev-auto-trim
+    environment:
+      - VIDEO_ROOT=/app/videos
+      - WORK_DIR=/tmp/auto-trim
+      # Trims run as jobs and share these encode slots, so several videos can be in
+      # flight without oversubscribing the machine. Left unset, ENCODE_WORKERS is
+      # the core count divided by THREADS_PER_CHUNK.
+      - MAX_ACTIVE_JOBS=4
+      # - ENCODE_WORKERS=4
+      # - THREADS_PER_CHUNK=2
+      # Longest video a trim will accept, in seconds (3 hours).
+      - MAX_DURATION_SECONDS=10800
+    volumes:
+      - videos_data:/app/videos
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -42,12 +62,15 @@ services:
       # WEB_CONCURRENCY, ...) comes from env_file below.
       - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-borntodev_db}
       - FRAME_EXTRACTOR_URL=http://frame-extractor:8081
+      - AUTO_TRIM_URL=http://auto-trim:8082
     env_file:
       - .env
     depends_on:
       db:
         condition: service_healthy
       frame-extractor:
+        condition: service_started
+      auto-trim:
         condition: service_started
     volumes:
       - videos_data:/app/videos

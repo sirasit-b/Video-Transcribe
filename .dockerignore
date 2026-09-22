@@ -14,6 +14,7 @@ texts/
 
 # Rust service build artifacts
 frame-extractor-rs/target/
+auto-trim-rs/target/
 
 # Frontend build artifacts
 frontend/.next/

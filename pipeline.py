@@ -267,6 +267,113 @@ def extract_evenly_spaced_frames_via_service(
 	return frame_paths
 
 
+# Auto trim (cutting the silent parts out of a video) runs in the auto-trim-rs
+# service, which ports auto-editor's edit decision — per-frame audio peaks, a
+# threshold, a margin around every active run, then the short-run smoothing pass.
+# There is deliberately no local fallback: a second implementation of that decision
+# here would drift from what the service keeps, and a video trimmed two different
+# ways depending on deployment is worse than a clear error.
+#
+# Everything is a job. A three-hour video takes minutes to analyze and render, so
+# the service starts the work and answers with a job id; the calls below are all
+# quick, and progress comes from polling. Job state lives in the service, not here,
+# because the backend runs several uvicorn workers and any of them may take the poll.
+AUTO_TRIM_TIMEOUT = int(os.getenv("AUTO_TRIM_TIMEOUT", "120"))
+
+
+class AutoTrimError(RuntimeError):
+	"""A failed auto trim call, carrying the status the service answered with.
+
+	The service separates "you asked for something impossible" (400 for a bad
+	threshold or a video past the length limit, 429 when too many jobs are already
+	running) from "ffmpeg broke" (5xx), so `status_code` lets the API hand a real
+	reason back to the user instead of flattening everything into a 500.
+	"""
+
+	def __init__(self, message: str, status_code: int = 502):
+		super().__init__(message)
+		self.status_code = status_code
+
+
+def _auto_trim_call(path: str, payload: dict | None = None, method: str = "POST") -> dict:
+	service_url = os.getenv("AUTO_TRIM_URL")
+	if not service_url:
+		raise AutoTrimError("Auto trim service is not configured (set AUTO_TRIM_URL)", 503)
+
+	data = None if payload is None else json.dumps(payload).encode("utf-8")
+	request = urllib.request.Request(
+		service_url.rstrip("/") + path,
+		data=data,
+		headers={"Content-Type": "application/json"},
+		method=method,
+	)
+
+	try:
+		with urllib.request.urlopen(request, timeout=AUTO_TRIM_TIMEOUT) as response:
+			body = response.read().decode("utf-8")
+	except urllib.error.HTTPError as exc:
+		detail = exc.read().decode("utf-8", errors="replace").strip()
+		raise AutoTrimError(detail or f"Auto trim service error ({exc.code})", exc.code) from exc
+	except urllib.error.URLError as exc:
+		raise AutoTrimError(f"Could not reach auto trim service: {exc.reason}", 503) from exc
+
+	return json.loads(body)
+
+
+def _auto_trim_options(options: dict) -> dict:
+	"""Drop unset options, so the service applies auto-editor's own defaults."""
+	return {key: value for key, value in options.items() if value is not None}
+
+
+def auto_trim_capabilities() -> dict:
+	"""What the trim service found on its machine: the CPU, and whether a GPU encoder
+	is usable from inside its container.
+
+	The service tests each candidate by encoding a real clip through the same filter
+	chain a render uses, so this reports what *works*, not what ffmpeg was built with.
+	"""
+	return _auto_trim_call("/capabilities", method="GET")
+
+
+def auto_trim_estimate(video_path: str, assumed_kept_ratio: float | None = None) -> dict:
+	"""How long a trim would take, from the file's shape alone (no decoding).
+
+	Before anything is analyzed the kept length is unknown, so the estimate assumes
+	the whole video survives and is therefore an upper bound.
+	"""
+	payload = {"video_path": str(Path(video_path).resolve())}
+	if assumed_kept_ratio is not None:
+		payload["assumed_kept_ratio"] = assumed_kept_ratio
+	return _auto_trim_call("/estimate", payload)
+
+
+def auto_trim_start(
+	video_path: str,
+	mode: str,
+	output_path: str | None = None,
+	**options,
+) -> dict:
+	"""Start an `analyze` or `trim` job and return its first status."""
+	payload = {
+		"mode": mode,
+		"video_path": str(Path(video_path).resolve()),
+		**_auto_trim_options(options),
+	}
+	if output_path is not None:
+		payload["output_path"] = str(Path(output_path).resolve())
+	return _auto_trim_call("/jobs", payload)
+
+
+def auto_trim_job(job_id: str) -> dict:
+	"""Poll one job: phase, progress, ETA, and its result once it is done."""
+	return _auto_trim_call(f"/jobs/{job_id}", method="GET")
+
+
+def auto_trim_cancel(job_id: str) -> dict:
+	"""Stop a job and kill the ffmpeg processes it has running."""
+	return _auto_trim_call(f"/jobs/{job_id}", method="DELETE")
+
+
 # The whole pipeline is Thai-only today; the API takes an ISO code.
 TRANSCRIBE_LANGUAGE = os.getenv("TRANSCRIBE_LANGUAGE", "th")
 

@@ -49,6 +49,16 @@ class Video(Base):
     polish_report = Column(JSON, nullable=True)
     # Time and token cost of the last LLM proofreading run.
     rewrite_stats = Column(JSON, nullable=True)
+    # Path of the last auto-trimmed render, relative to the videos directory.
+    trim_filename = Column(String, nullable=True)
+    # The auto trim job currently running for this video, if any. Kept here rather
+    # than in the request that started it, so a reload (or another uvicorn worker)
+    # can pick the polling back up and file the result.
+    trim_job_id = Column(String, nullable=True)
+    # What that trim cut: durations, frame counts, settings and timings. The
+    # segment list is left out on purpose — it is large, and every video load
+    # would carry it; re-run the preview to get the ranges back.
+    trim_result = Column(JSON, nullable=True)
     is_deleted = Column(Boolean, nullable=False, default=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
