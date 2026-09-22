@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 import pipeline
 import caption_polish
+import caption_timeline
 import fcpxml
 import timeline_json
 import glossary as glossary_module
@@ -427,6 +428,10 @@ class SyncSessionCreate(BaseModel):
 
 class SyncSessionMembers(BaseModel):
     video_ids: List[int]
+
+
+class SyncSessionUpdate(BaseModel):
+    name: str
 
 
 class SessionSyncRequest(BaseModel):
@@ -1706,6 +1711,23 @@ def get_session(
     return _session_payload(_get_owned_session(session_id, db, current_user), db)
 
 
+@app.patch("/api/sessions/{session_id}")
+def rename_session(
+    session_id: int,
+    payload: SyncSessionUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    session = _get_owned_session(session_id, db, current_user)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A session needs a name")
+    session.name = name
+    db.commit()
+    db.refresh(session)
+    return _session_payload(session, db)
+
+
 @app.delete("/api/sessions/{session_id}", status_code=204)
 def delete_session(
     session_id: int,
@@ -2046,16 +2068,51 @@ def get_video_captions_vtt(
         raise HTTPException(status_code=404, detail="Captions not available")
     return Response(content=pipeline.segments_to_vtt(video.caption_segments), media_type="text/vtt")
 
+# A transcript is made from the recording as it was shot, and the trim takes the
+# silences out of it, so by the end of a long take the two timelines are minutes
+# apart. `timeline=trimmed` moves the cues onto the cut — which is what anyone
+# watching the trimmed file, or editing with it, actually needs.
+_TIMELINE_HELP = "source (as recorded) or trimmed (timed against the cut)"
+
+
+def _captions_for_timeline(video: models.Video, timeline: str) -> list[dict]:
+    if not video.caption_segments:
+        raise HTTPException(status_code=404, detail="Captions not available")
+    if timeline != "trimmed":
+        return video.caption_segments
+    if not video.trim_segments:
+        raise HTTPException(
+            status_code=409,
+            detail="This video has no trim to time the captions against",
+        )
+    return caption_timeline.shift_captions(video.caption_segments, video.trim_segments)
+
+
+@app.get("/api/videos/{video_id}/captions.json")
+def get_video_captions_json(
+    video_id: int,
+    timeline: str = Query("source", pattern="^(source|trimmed)$", description=_TIMELINE_HELP),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """The cues as data, for a page that plays along with them."""
+    video = _get_owned_video(video_id, db, current_user)
+    cues = _captions_for_timeline(video, timeline)
+    return {"timeline": timeline, "segments": cues}
+
+
 @app.get("/api/videos/{video_id}/captions.srt")
 def get_video_captions_srt(
     video_id: int,
+    timeline: str = Query("source", pattern="^(source|trimmed)$", description=_TIMELINE_HELP),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_user),
 ):
     video = _get_owned_video(video_id, db, current_user)
-    if not video.caption_segments:
-        raise HTTPException(status_code=404, detail="Captions not available")
-    return Response(content=pipeline.segments_to_srt(video.caption_segments), media_type="application/x-subrip")
+    cues = _captions_for_timeline(video, timeline)
+    return Response(
+        content=pipeline.segments_to_srt(cues), media_type="application/x-subrip"
+    )
 
 @app.post("/api/videos/{video_id}/captions", response_model=VideoResponse)
 async def upload_captions(

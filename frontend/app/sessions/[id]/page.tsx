@@ -7,18 +7,23 @@ import axios from "axios";
 import {
   AlertCircle,
   ArrowLeft,
+  Check,
   CheckCircle2,
   Clock,
+  Download,
+  FileText,
   Link2,
   Loader2,
+  Pencil,
   Scissors,
+  Sparkles,
   Star,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
-import { api } from "../../lib/api";
-import SyncedPlayer, { PlayerTrack } from "./SyncedPlayer";
+import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
+import SyncedPlayer, { Cue, PlayerTrack } from "./SyncedPlayer";
 
 interface Waveform {
   buckets: number;
@@ -45,9 +50,16 @@ interface MemberSync {
   gain_db?: number | null;
 }
 
+interface TranscribeModel {
+  id: string;
+  label: string;
+  is_default: boolean;
+}
+
 interface SessionVideo {
   id: number;
   original_name: string;
+  has_transcript: boolean;
   trim_filename: string | null;
   trim_result: (Record<string, unknown> & { waveform?: Waveform; output_duration?: number }) | null;
   sync_result: MemberSync | null;
@@ -104,6 +116,32 @@ function dragHasFiles(event: DragEvent): boolean {
   return types ? Array.from(types).includes("Files") : false;
 }
 
+function withAuthToken(url: string): string {
+  const token = typeof window !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
+  if (!token) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+}
+
+/** Save a response body under a name of our choosing.
+ *
+ *  Fetched rather than linked because the captions endpoint reads the token from
+ *  the header, and an `<a href>` cannot send one.
+ */
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function baseName(name: string): string {
+  return name.replace(/\.[^./\\]+$/, "") || name;
+}
+
 function formatDuration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "-";
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
@@ -124,6 +162,16 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const dragDepthRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const srtInputRef = useRef<HTMLInputElement>(null);
+  const [srtTarget, setSrtTarget] = useState<number | null>(null);
+  const [models, setModels] = useState<TranscribeModel[]>([]);
+  const [model, setModel] = useState("");
+  const [transcribing, setTranscribing] = useState<number | null>(null);
+  const [nameDraft, setNameDraft] = useState<string | null>(null);
+  const [savingName, setSavingName] = useState(false);
+  // Whose transcript is shown with the playback: the one being listened to.
+  const [readingIndex, setReadingIndex] = useState(0);
+  const [cues, setCues] = useState<Cue[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -141,6 +189,18 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await api.get<TranscribeModel[]>("/transcribe-models");
+        setModels(res.data);
+        setModel(res.data.find((m) => m.is_default)?.id ?? res.data[0]?.id ?? "");
+      } catch (err) {
+        console.error(err);
+      }
+    })();
+  }, []);
 
   /** Upload straight into the session, so a file dropped here is a member of it
    *  from the moment it lands rather than something to go and find afterwards. */
@@ -289,6 +349,74 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
     }
   };
 
+  const saveName = async () => {
+    const name = (nameDraft ?? "").trim();
+    if (!name || name === session?.name) {
+      setNameDraft(null);
+      return;
+    }
+    setSavingName(true);
+    try {
+      const res = await api.patch<SessionData>(`/sessions/${sessionId}`, { name });
+      setSession(res.data);
+      setNameDraft(null);
+    } catch (err) {
+      console.error(err);
+      setError("เปลี่ยนชื่อเซสชันไม่สำเร็จ");
+    } finally {
+      setSavingName(false);
+    }
+  };
+
+  /** Transcribe one recording. The source is transcribed, not the cut, so the
+   *  transcript survives a re-trim; the cues are moved onto the cut's clock
+   *  wherever they are shown or downloaded. */
+  const transcribe = async (videoId: number) => {
+    setTranscribing(videoId);
+    setError(null);
+    try {
+      await api.post(`/videos/${videoId}/transcribe`, { model: model || null });
+      await load();
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "ถอดเสียงไม่สำเร็จ");
+    } finally {
+      setTranscribing(null);
+    }
+  };
+
+  const uploadSrt = async (videoId: number, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      await api.post(`/videos/${videoId}/captions`, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      await load();
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "อัปโหลด SRT ไม่สำเร็จ");
+    }
+  };
+
+  /** The transcript as an .srt, timed against the cut when there is one — the
+   *  original timings would be minutes out against the trimmed file. */
+  const downloadSrt = async (video: SessionVideo) => {
+    try {
+      const res = await api.get(`/videos/${video.id}/captions.srt`, {
+        params: { timeline: video.trim_filename ? "trimmed" : "source" },
+        responseType: "blob",
+      });
+      const suffix = video.trim_filename ? "_trimmed" : "";
+      saveBlob(res.data as Blob, `${baseName(video.original_name)}${suffix}.srt`);
+    } catch (err) {
+      console.error(err);
+      setError("ดาวน์โหลด SRT ไม่สำเร็จ");
+    }
+  };
+
   const deleteSession = async () => {
     if (!confirm("ลบเซสชันนี้? (ไฟล์วิดีโอและไฟล์ที่ตัดแล้วยังอยู่)")) return;
     try {
@@ -299,6 +427,35 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
       setError("ลบเซสชันไม่สำเร็จ");
     }
   };
+
+  // Whoever is being listened to is who is being read. Fetched already timed
+  // against the cut, so the page never has to know what was taken out.
+  const members = session?.videos ?? [];
+  const reading = members[readingIndex] ?? members[0];
+  const readingId = reading?.id ?? null;
+  const readingHasCut = Boolean(reading?.trim_filename);
+  const readingHasTranscript = Boolean(reading?.has_transcript);
+  useEffect(() => {
+    if (!readingId || !readingHasTranscript) {
+      setCues([]);
+      return;
+    }
+    let active = true;
+    (async () => {
+      try {
+        const res = await api.get<{ segments: Cue[] }>(`/videos/${readingId}/captions.json`, {
+          params: { timeline: readingHasCut ? "trimmed" : "source" },
+        });
+        if (active) setCues(res.data.segments ?? []);
+      } catch (err) {
+        console.error(err);
+        if (active) setCues([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [readingId, readingHasCut, readingHasTranscript]);
 
   if (loading) {
     return (
@@ -318,7 +475,6 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
     );
   }
 
-  const members = session.videos;
   const synced = members.length > 1 && members.every((v) => v.sync_result);
   const cut = members.length > 1 && members.every((v) => v.trim_filename);
   const playerTracks: PlayerTrack[] = members.map((video) => ({
@@ -347,7 +503,53 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
             <ArrowLeft className="w-4 h-4" strokeWidth={1.5} />
             เซสชันทั้งหมด
           </Link>
-          <h1 className="text-3xl font-semibold tracking-tight text-gray-900">{session.name}</h1>
+          {nameDraft === null ? (
+            <button
+              onClick={() => setNameDraft(session.name)}
+              title="เปลี่ยนชื่อเซสชัน"
+              className="group flex items-center gap-2 text-left"
+            >
+              <h1 className="text-3xl font-semibold tracking-tight text-gray-900">
+                {session.name}
+              </h1>
+              <Pencil
+                className="w-4 h-4 text-gray-300 group-hover:text-gray-500 transition-colors"
+                strokeWidth={1.5}
+              />
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <input
+                autoFocus
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") saveName();
+                  if (e.key === "Escape") setNameDraft(null);
+                }}
+                className="text-3xl font-semibold tracking-tight text-gray-900 border-b border-gray-300 focus:border-blue-500 focus:outline-none bg-transparent"
+              />
+              <button
+                onClick={saveName}
+                disabled={savingName}
+                className="p-1.5 text-gray-400 hover:text-emerald-600 disabled:opacity-50"
+                aria-label="บันทึกชื่อ"
+              >
+                {savingName ? (
+                  <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                ) : (
+                  <Check className="w-4 h-4" strokeWidth={1.5} />
+                )}
+              </button>
+              <button
+                onClick={() => setNameDraft(null)}
+                className="p-1.5 text-gray-400 hover:text-gray-700"
+                aria-label="ยกเลิก"
+              >
+                <X className="w-4 h-4" strokeWidth={1.5} />
+              </button>
+            </div>
+          )}
           <p className="text-sm text-gray-500 mt-1 max-w-2xl">
             วางไฟล์ของเซสชันเดียวกันลงหน้านี้ได้เลย ระบบจะปรับระดับเสียงให้เท่ากันก่อน
             แล้วหาว่าแต่ละคลิปเริ่มห่างกันกี่วินาทีจากเสียงที่ไมค์ทุกตัวได้ยินร่วมกัน
@@ -415,6 +617,57 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
                   {video.trim_filename && <span className="text-emerald-700">ตัดแล้ว</span>}
                 </p>
               </div>
+              {/* Everything you would otherwise leave the session to do. */}
+              {video.trim_filename && (
+                <a
+                  href={withAuthToken(
+                    `${MEDIA_BASE}/api/videos/${video.id}/trimmed?download=true`
+                  )}
+                  title="ดาวน์โหลดไฟล์ที่ตัดแล้ว"
+                  className="shrink-0 p-1.5 text-gray-400 hover:text-blue-600"
+                >
+                  <Download className="w-4 h-4" strokeWidth={1.5} />
+                </a>
+              )}
+              <button
+                onClick={() => transcribe(video.id)}
+                disabled={transcribing !== null || jobActive}
+                title={video.has_transcript ? "ถอดเสียงใหม่" : "ถอดเสียงคลิปนี้"}
+                className={`shrink-0 p-1.5 disabled:opacity-40 ${
+                  video.has_transcript
+                    ? "text-emerald-600 hover:text-emerald-700"
+                    : "text-gray-300 hover:text-gray-600"
+                }`}
+              >
+                {transcribing === video.id ? (
+                  <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                ) : (
+                  <Sparkles className="w-4 h-4" strokeWidth={1.5} />
+                )}
+              </button>
+              <button
+                onClick={() => {
+                  setSrtTarget(video.id);
+                  srtInputRef.current?.click();
+                }}
+                title="อัปโหลด SRT ให้คลิปนี้"
+                className="shrink-0 p-1.5 text-gray-300 hover:text-gray-600"
+              >
+                <Upload className="w-4 h-4" strokeWidth={1.5} />
+              </button>
+              {video.has_transcript && (
+                <button
+                  onClick={() => downloadSrt(video)}
+                  title={
+                    video.trim_filename
+                      ? "ดาวน์โหลด SRT (เวลาตรงกับไฟล์ที่ตัดแล้ว)"
+                      : "ดาวน์โหลด SRT"
+                  }
+                  className="shrink-0 p-1.5 text-gray-300 hover:text-gray-600"
+                >
+                  <FileText className="w-4 h-4" strokeWidth={1.5} />
+                </button>
+              )}
               {!isReference && (
                 <button
                   onClick={() => makeReference(video.id)}
@@ -480,6 +733,31 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
             const files = Array.from(e.target.files ?? []);
             e.target.value = "";
             uploadFiles(files);
+          }}
+        />
+        <select
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          aria-label="โมเดลถอดเสียง"
+          title="โมเดลที่ใช้เมื่อกดถอดเสียงในรายการด้านบน"
+          className="border border-gray-200 rounded-full px-4 py-2 text-sm text-gray-700 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400"
+        >
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        <input
+          ref={srtInputRef}
+          type="file"
+          accept=".srt,text/plain"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";
+            if (file && srtTarget !== null) uploadSrt(srtTarget, file);
+            setSrtTarget(null);
           }}
         />
         <button
@@ -551,9 +829,16 @@ export default function SessionPage({ params }: { params: Promise<{ id: string }
             <p className="text-sm text-gray-500 mt-1">
               กดเล่นครั้งเดียว ทุกคลิปเดินพร้อมกัน เส้นเสียงวางเป็นชั้น ๆ บนแกนเวลาเดียวกัน
               ถ้าตรงกันจริง จังหวะเงียบและจังหวะพูดของทุกเส้นจะอยู่ตรงกันพอดี
+              {cues.length > 0
+                ? " ข้อความด้านล่างจะไล่ไฟตามที่กำลังพูด กดที่บรรทัดไหนก็กระโดดไปตรงนั้น"
+                : " ถอดเสียงคลิปไหนไว้ ข้อความจะขึ้นมาไล่ตามเสียงที่กำลังฟังอยู่"}
             </p>
           </div>
-          <SyncedPlayer tracks={playerTracks} />
+          <SyncedPlayer
+            tracks={playerTracks}
+            cues={cues}
+            onAudibleChange={setReadingIndex}
+          />
         </div>
       )}
     </main>

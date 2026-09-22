@@ -4,6 +4,12 @@ import { useEffect, useRef, useState } from "react";
 import { Pause, Play, Volume2, VolumeX, SkipBack } from "lucide-react";
 import { MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
+export interface Cue {
+  start: number;
+  end: number;
+  text: string;
+}
+
 export interface PlayerTrack {
   id: number;
   name: string;
@@ -90,7 +96,75 @@ function WaveformRow({
  * Only one is audible at a time. Two microphones that heard the same room, played
  * together, comb-filter into something that sounds like neither.
  */
-export default function SyncedPlayer({ tracks }: { tracks: PlayerTrack[] }) {
+/** The transcript, read along with the playback.
+ *
+ *  The cues arrive already timed against the cut — the transcript is made from the
+ *  recording as it was shot, and the trim takes the silences out of it, so by the
+ *  end of a long take the two clocks are minutes apart.
+ */
+function Transcript({
+  cues,
+  time,
+  onSeek,
+}: {
+  cues: Cue[];
+  time: number;
+  onSeek: (seconds: number) => void;
+}) {
+  const active = cues.findIndex((cue) => time >= cue.start && time < cue.end);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const activeRef = useRef<HTMLButtonElement>(null);
+
+  // Keep the lit line in the middle, and only move when it changes: scrolling on
+  // every frame would fight anyone reading ahead.
+  useEffect(() => {
+    const line = activeRef.current;
+    const box = containerRef.current;
+    if (!line || !box) return;
+    const wanted = line.offsetTop - box.clientHeight / 2 + line.clientHeight / 2;
+    box.scrollTo({ top: Math.max(0, wanted), behavior: "smooth" });
+  }, [active]);
+
+  if (cues.length === 0) return null;
+
+  return (
+    <div
+      ref={containerRef}
+      className="max-h-56 overflow-y-auto rounded-xl border border-gray-200 bg-white p-3 flex flex-col gap-0.5"
+    >
+      {cues.map((cue, index) => (
+        <button
+          key={`${cue.start}-${index}`}
+          ref={index === active ? activeRef : undefined}
+          onClick={() => onSeek(cue.start)}
+          className={`text-left rounded-lg px-2 py-1 transition-colors ${
+            index === active
+              ? "bg-blue-50 text-gray-900"
+              : index < active
+              ? "text-gray-400 hover:bg-gray-50"
+              : "text-gray-600 hover:bg-gray-50"
+          }`}
+        >
+          <span className="text-[11px] tabular-nums text-gray-400 mr-2">
+            {formatTime(cue.start)}
+          </span>
+          {cue.text}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export default function SyncedPlayer({
+  tracks,
+  cues = [],
+  onAudibleChange,
+}: {
+  tracks: PlayerTrack[];
+  /** The transcript of whichever recording is being listened to. */
+  cues?: Cue[];
+  onAudibleChange?: (index: number) => void;
+}) {
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -186,7 +260,10 @@ export default function SyncedPlayer({ tracks }: { tracks: PlayerTrack[] }) {
                 onEnded={() => setPlaying(false)}
               />
               <button
-                onClick={() => setAudible(index)}
+                onClick={() => {
+                  setAudible(index);
+                  onAudibleChange?.(index);
+                }}
                 title={index === audible ? "กำลังฟังเสียงนี้" : "ฟังเสียงของคลิปนี้"}
                 className={`absolute bottom-2 right-2 p-1.5 rounded-full transition-colors ${
                   index === audible
@@ -283,6 +360,8 @@ export default function SyncedPlayer({ tracks }: { tracks: PlayerTrack[] }) {
           {formatTime(time)} / {formatTime(total)}
         </span>
       </div>
+
+      <Transcript cues={cues} time={time} onSeek={seek} />
     </div>
   );
 }
