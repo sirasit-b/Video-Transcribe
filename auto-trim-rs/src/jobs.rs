@@ -18,6 +18,8 @@ pub enum Mode {
     Analyze,
     /// Decide the edit, then render the kept frames to a file.
     Trim,
+    /// Line up two recordings by their sound, without cutting anything.
+    Sync,
 }
 
 impl Mode {
@@ -25,6 +27,7 @@ impl Mode {
         match self {
             Mode::Analyze => "analyze",
             Mode::Trim => "trim",
+            Mode::Sync => "sync",
         }
     }
 }
@@ -133,8 +136,10 @@ impl Progress {
         self.rendered_frames.fetch_add(frames, Ordering::Relaxed);
     }
 
-    pub fn set_audio_total(&self, samples: u64) {
-        self.audio_total.store(samples, Ordering::Relaxed);
+    /// Adds rather than replaces: a pair is two renders inside one job, and the
+    /// bar has to span both of them.
+    pub fn add_audio_total(&self, samples: u64) {
+        self.audio_total.fetch_add(samples, Ordering::Relaxed);
     }
 
     pub fn add_audio_samples(&self, samples: u64) {
@@ -476,7 +481,7 @@ mod tests {
             finish: 0.0,
         });
         progress.set_phase(Phase::Rendering);
-        progress.set_audio_total(200);
+        progress.add_audio_total(200);
         progress.add_audio_samples(50);
         assert!((progress.fraction() - 0.25).abs() < 1e-9);
     }
@@ -494,7 +499,7 @@ mod tests {
         progress.set_phase(Phase::Rendering);
         progress.set_kept_frames(100);
         progress.add_rendered_frames(100);
-        progress.set_audio_total(300);
+        progress.add_audio_total(300);
         progress.add_audio_samples(100);
         assert!(
             (progress.fraction() - 1.0 / 3.0).abs() < 1e-9,

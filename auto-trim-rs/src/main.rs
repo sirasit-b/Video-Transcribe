@@ -19,6 +19,7 @@ mod mask;
 mod probe;
 mod proc;
 mod render;
+mod sync;
 
 use std::{
     env,
@@ -118,6 +119,22 @@ fn default_waveform_buckets() -> usize {
 enum RequestMode {
     Analyze,
     Trim,
+    /// Measure how far apart two recordings started, and stop there.
+    Sync,
+}
+
+/// Which soundtrack decides the edit when there are two files.
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+enum EditSource {
+    /// A frame survives if either recording was loud there. Two files stacked on
+    /// one timeline are two tracks of one edit, and `--edit audio` keeps a frame
+    /// any one of its tracks speaks in — so the camera does not cut away from a
+    /// moment only the screen recording heard.
+    #[default]
+    Both,
+    /// Only the first recording is listened to.
+    Primary,
 }
 
 #[derive(Clone, Deserialize)]
@@ -144,6 +161,26 @@ struct JobRequest {
     audio_coder: Option<String>,
     #[serde(default)]
     audio_fade_ms: Option<f64>,
+
+    // --- the second recording, for a synced pair -----------------------------
+    /// A camera take and a screen capture of the same session. With this set,
+    /// `sync` measures the gap between them and `trim` cuts both to one timeline.
+    #[serde(default)]
+    second_video_path: Option<String>,
+    /// Required to trim a pair.
+    #[serde(default)]
+    second_output_path: Option<String>,
+    /// A gap already measured, or corrected by hand, in seconds: where the second
+    /// recording starts on the first one's clock. Skips the search.
+    #[serde(default)]
+    offset_seconds: Option<f64>,
+    /// Whether to check that the two recorders kept the same time. On by default;
+    /// it costs a few excerpt reads and catches the slip that makes a long pair
+    /// drift apart by the end.
+    #[serde(default)]
+    check_drift: Option<bool>,
+    #[serde(default)]
+    edit_source: EditSource,
 }
 
 #[derive(Deserialize)]
@@ -712,6 +749,11 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
     }
 
     let trim = request.mode == RequestMode::Trim;
+    if request.mode == RequestMode::Sync && request.second_video_path.is_none() {
+        return Err(bad_request(
+            "second_video_path is required to line two recordings up",
+        ));
+    }
     let output = if trim {
         let requested = request
             .output_path
@@ -726,6 +768,23 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
     // Probing here means a file that cannot be trimmed at all is refused now,
     // with a reason, instead of becoming a job that fails a moment later.
     let source = open_source(&state, &request.edit.video_path)?;
+    let second = match request.second_video_path.as_deref().filter(|p| !p.is_empty()) {
+        Some(path) => Some(open_source(&state, path)?),
+        None => None,
+    };
+    let second_output = match (trim, &second) {
+        (true, Some(_)) => {
+            let requested = request
+                .second_output_path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    bad_request("second_output_path is required to trim a pair")
+                })?;
+            Some(resolve_output_within(&state.video_root, requested).map_err(bad_request)?)
+        }
+        _ => None,
+    };
     let estimate = state.calibration.estimate(
         &source.info,
         source.timebase.as_f64(),
@@ -735,7 +794,11 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
         state.workers,
     );
 
-    let mode = if trim { Mode::Trim } else { Mode::Analyze };
+    let mode = match request.mode {
+        RequestMode::Trim => Mode::Trim,
+        RequestMode::Sync => Mode::Sync,
+        RequestMode::Analyze => Mode::Analyze,
+    };
     let job = state
         .jobs
         .create(mode, source.path.to_string_lossy().into_owned())
@@ -746,21 +809,52 @@ fn launch(state: Arc<AppState>, request: JobRequest) -> Result<JobStatus, Proble
             ),
         })?;
 
-    job.progress.set_weights(estimate.weights());
+    // A sync job only decodes; weighting it with a render and a mux it will never
+    // do would leave the bar crawling through a first phase that is the whole job.
+    job.progress.set_weights(if request.mode == RequestMode::Sync {
+        PhaseWeights {
+            analyze: 1.0,
+            render: 0.0,
+            finish: 0.0,
+        }
+    } else {
+        estimate.weights()
+    });
     job.progress.set_phase(Phase::Analyzing);
-    job.progress.set_expected_frames(
-        (source.info.duration * source.timebase.as_f64()).round() as u64
-            * source.info.audio.len().max(1) as u64,
-    );
-    if let Ok(mut slot) = job.estimate.lock() {
-        *slot = serde_json::to_value(&estimate).ok();
+    if request.mode == RequestMode::Sync {
+        let second_duration = second.as_ref().map(|s| s.info.duration).unwrap_or(0.0);
+        job.progress
+            .set_expected_frames(sync_analysis_units(source.info.duration, second_duration));
+    } else {
+        let frames = |source: &Source| {
+            (source.info.duration * source.timebase.as_f64()).round() as u64
+                * source.info.audio.len().max(1) as u64
+        };
+        job.progress.set_expected_frames(
+            frames(&source) + second.as_ref().map(frames).unwrap_or(0),
+        );
+    }
+    if request.mode != RequestMode::Sync {
+        // The estimate models a trim, so it would only mislead a job that renders
+        // nothing; the measured pace fills the ETA in soon enough on its own.
+        if let Ok(mut slot) = job.estimate.lock() {
+            *slot = serde_json::to_value(&estimate).ok();
+        }
     }
 
     let status = status_of(&job);
     let worker_state = Arc::clone(&state);
     let worker_job = Arc::clone(&job);
     std::thread::spawn(move || {
-        let outcome = run_job(&worker_state, &worker_job, &request, source, output);
+        let outcome = run_job(
+            &worker_state,
+            &worker_job,
+            &request,
+            source,
+            second,
+            output,
+            second_output,
+        );
         worker_job.finish(match outcome {
             Ok(value) => Outcome::Done(value),
             Err(WorkError::Canceled) => Outcome::Canceled,
@@ -833,6 +927,49 @@ struct Decision {
     segments: Vec<(usize, usize)>,
     kept_frames: usize,
     analysis: Analysis,
+    /// The same edit as the second recording sees it, when there is one.
+    pair: Option<PairEdit>,
+}
+
+/// The second recording's half of a shared edit: the same moments, counted in its
+/// own frames, and how its clock relates to the first one's.
+struct PairEdit {
+    segments: Vec<(usize, usize)>,
+    streams: Vec<audio::StreamAnalysis>,
+    clock: sync::Clock,
+}
+
+impl PairEdit {
+    fn kept_frames(&self) -> usize {
+        self.segments.iter().map(|&(start, end)| end - start).sum()
+    }
+
+    fn cut(&self) -> Cut<'_> {
+        Cut {
+            streams: &self.streams,
+            segments: &self.segments,
+            kept_frames: self.kept_frames(),
+        }
+    }
+}
+
+/// What a render needs: which moments to keep, and where each one begins and ends
+/// in each soundtrack. Borrowed rather than owned, because for a three-hour file
+/// this is megabytes of levels that the render only reads.
+struct Cut<'a> {
+    streams: &'a [audio::StreamAnalysis],
+    segments: &'a [(usize, usize)],
+    kept_frames: usize,
+}
+
+impl Decision {
+    fn cut(&self) -> Cut<'_> {
+        Cut {
+            streams: &self.streams,
+            segments: &self.segments,
+            kept_frames: self.kept_frames,
+        }
+    }
 }
 
 fn analyze(
@@ -842,12 +979,35 @@ fn analyze(
     source: &Source,
 ) -> WorkResult<Decision> {
     let started = Instant::now();
+    let streams = stream_levels(state, job, source)?;
+    decide(state, request, source, streams, None, None, started)
+}
+
+/// How much decoding a sync job has ahead of it, in the units the envelope reader
+/// counts in — one per 512 bytes of 16-bit mono audio.
+fn sync_analysis_units(a_duration: f64, b_duration: f64) -> u64 {
+    let units = |seconds: f64| seconds * sync::DECODE_RATE as f64 * 2.0 / 512.0;
+    // Both files end to end, plus the excerpts the refinement and the drift check
+    // read back: six windows, both sides, a little over the window length each.
+    units(a_duration + b_duration) as u64 + (units(WINDOW_READS) * 12.0) as u64
+}
+
+/// Seconds of audio one refinement window reads from one file.
+const WINDOW_READS: f64 = 34.0;
+
+/// Every audio track of one file, as levels per frame.
+///
+/// One decoder per track, in parallel: `--edit audio` analyzes every stream, and a
+/// frame survives if any one of them is loud enough.
+fn stream_levels(
+    state: &AppState,
+    job: &Job,
+    source: &Source,
+) -> WorkResult<Vec<audio::StreamAnalysis>> {
     let timebase = source.timebase.as_f64();
     let path = &source.path;
 
-    // One decoder per audio track, in parallel: `--edit audio` analyzes every
-    // stream and a frame survives if any one of them is loud enough.
-    let streams: Vec<audio::StreamAnalysis> = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let handles: Vec<_> = source
             .info
             .audio
@@ -900,8 +1060,26 @@ fn analyze(
             Some(err) => Err(err),
             None => Ok(analyses),
         }
-    })?;
+    })
+}
 
+/// Turn levels into an edit: threshold, margins, smoothing, and what it all adds
+/// up to.
+///
+/// `extra_levels` is a second recording's loudness laid over this one's frames, so
+/// a pair can be cut on what either of them heard. `limit` narrows the edit to a
+/// range of frames, which is how a pair is held to the stretch both files cover.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    state: &AppState,
+    request: &EditRequest,
+    source: &Source,
+    streams: Vec<audio::StreamAnalysis>,
+    extra_levels: Option<&[u16]>,
+    limit: Option<(usize, usize)>,
+    started: Instant,
+) -> WorkResult<Decision> {
+    let timebase = source.timebase.as_f64();
     let threshold = audio::to_unorm16(request.threshold);
     let total_frames = streams
         .iter()
@@ -911,6 +1089,13 @@ fn analyze(
     let mut active = vec![false; total_frames];
     for stream in &streams {
         for (index, &level) in stream.levels.iter().enumerate() {
+            if level >= threshold {
+                active[index] = true;
+            }
+        }
+    }
+    if let Some(levels) = extra_levels {
+        for (index, &level) in levels.iter().take(total_frames).enumerate() {
             if level >= threshold {
                 active[index] = true;
             }
@@ -928,6 +1113,16 @@ fn analyze(
 
     mask::mut_margin(&mut active, margin_frames.0, margin_frames.1);
     mask::smoothing(&mut active, smooth_frames.0, smooth_frames.1);
+    if let Some((first, last)) = limit {
+        // After the margins, so a margin cannot reach past the end of what the
+        // other recording covers, and on the mask rather than the segments so the
+        // waveform the browser draws shows the same edit that was rendered.
+        for frame in 0..total_frames {
+            if frame < first || frame >= last {
+                active[frame] = false;
+            }
+        }
+    }
 
     let segments = mask::active_segments(&active);
     let kept_frames: usize = segments.iter().map(|&(start, end)| end - start).sum();
@@ -1011,17 +1206,162 @@ fn analyze(
         segments,
         kept_frames,
         analysis,
+        pair: None,
     })
 }
 
+/// One track of a file, named the way the second recording is asked for.
+fn first_track(source: &Source) -> sync::Track {
+    sync::Track {
+        path: source.path.clone(),
+        ordinal: source.info.audio.first().map(|a| a.ordinal).unwrap_or(0),
+    }
+}
+
+/// Measure the gap between two recordings, or take the one the caller supplied.
+fn line_up(
+    state: &AppState,
+    job: &Job,
+    request: &JobRequest,
+    source: &Source,
+    second: &Source,
+) -> WorkResult<sync::SyncReport> {
+    if let Some(offset) = request.offset_seconds {
+        if !offset.is_finite() {
+            return Err(WorkError::Failed("offset_seconds must be a number".to_string()));
+        }
+        // Given by hand, so it is taken as read; someone who typed it in has
+        // already decided they trust it more than a measurement.
+        return Ok(sync::SyncReport::supplied(
+            offset,
+            source.info.duration,
+            second.info.duration,
+        ));
+    }
+    sync::measure(
+        &state.ffmpeg,
+        &first_track(source),
+        &first_track(second),
+        source.info.duration,
+        second.info.duration,
+        request.check_drift.unwrap_or(true),
+        job,
+    )
+}
+
+/// Decide one edit for two recordings.
+///
+/// The edit lives on the first recording's clock and is held to the stretch both
+/// files cover, so the two cuts are the same moments and the same length. Nothing
+/// outside the overlap can be kept: one file has no picture there, and a pair
+/// where one side is missing frames is a pair that never lines up again.
+fn analyze_pair(
+    state: &AppState,
+    job: &Job,
+    request: &JobRequest,
+    source: &Source,
+    second: &Source,
+    report: &sync::SyncReport,
+) -> WorkResult<Decision> {
+    if !report.reliable {
+        return Err(WorkError::Failed(
+            report
+                .warning
+                .clone()
+                .unwrap_or_else(|| "these two recordings could not be lined up".to_string()),
+        ));
+    }
+    let started = Instant::now();
+    let timebase = source.timebase.as_f64();
+    let clock = report.clock();
+
+    let streams = stream_levels(state, job, source)?;
+    // The second recording is decoded whichever soundtrack decides the edit: its
+    // sample boundaries are what the splice cuts on.
+    let second_streams = stream_levels(state, job, second)?;
+
+    let total_frames = streams
+        .iter()
+        .map(|stream| stream.levels.len())
+        .max()
+        .unwrap_or(0);
+    let extra = match request.edit_source {
+        EditSource::Both => {
+            let second_frames = second_streams
+                .iter()
+                .map(|stream| stream.levels.len())
+                .max()
+                .unwrap_or(0);
+            Some(sync::map_levels(
+                &combined_levels(&second_streams, second_frames),
+                second.timebase.as_f64(),
+                &clock,
+                total_frames,
+                timebase,
+            ))
+        }
+        EditSource::Primary => None,
+    };
+
+    let overlap = sync::shared_frames(report.overlap_on_a(), timebase);
+    let mut decision = decide(
+        state,
+        &request.edit,
+        source,
+        streams,
+        extra.as_deref(),
+        Some(overlap),
+        started,
+    )?;
+    decision.pair = Some(PairEdit {
+        segments: sync::shift_segments(
+            &decision.segments,
+            timebase,
+            second.timebase.as_f64(),
+            &clock,
+            second_streams
+                .iter()
+                .map(|stream| stream.levels.len())
+                .max()
+                .unwrap_or(0),
+        ),
+        streams: second_streams,
+        clock,
+    });
+    Ok(decision)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     state: &AppState,
     job: &Job,
     request: &JobRequest,
     source: Source,
+    second: Option<Source>,
     output: Option<PathBuf>,
+    second_output: Option<PathBuf>,
 ) -> WorkResult<serde_json::Value> {
-    let decision = analyze(state, job, &request.edit, &source)?;
+    // A pair has to be put on one clock before anything can be decided about it.
+    let pair = match &second {
+        Some(second) => Some(line_up(state, job, request, &source, second)?),
+        None => None,
+    };
+
+    if request.mode == RequestMode::Sync {
+        let report = pair.expect("a sync job is refused without a second file");
+        job.progress.set_phase(Phase::Finished);
+        return serde_json::to_value(json!({
+            "sync": report,
+            "video_path": source.path.to_string_lossy(),
+            "second_video_path": second.map(|s| s.path.to_string_lossy().into_owned()),
+        }))
+        .map_err(|err| WorkError::Failed(err.to_string()));
+    }
+
+    let decision = match (&second, &pair) {
+        (Some(second), Some(report)) => analyze_pair(state, job, request, &source, second, report)?,
+        _ => analyze(state, job, &request.edit, &source)?,
+    };
     let analysis_value = serde_json::to_value(&decision.analysis)
         .map_err(|err| WorkError::Failed(err.to_string()))?;
     if let Ok(mut slot) = job.analysis.lock() {
@@ -1029,6 +1369,26 @@ fn run_job(
     }
     if let Ok(mut slot) = job.segments.lock() {
         let timebase = source.timebase.as_f64();
+        let second_ranges = decision.pair.as_ref().zip(second.as_ref()).map(|(pair, file)| {
+            let second_timebase = file.timebase.as_f64();
+            json!({
+                "video_path": file.path.to_string_lossy(),
+                "clock": pair.clock,
+                "timebase": {"num": file.timebase.num, "den": file.timebase.den},
+                "fps": second_timebase,
+                "segment_count": pair.segments.len(),
+                "segments": pair
+                    .segments
+                    .iter()
+                    .map(|&(start, end)| json!({
+                        "start_frame": start,
+                        "end_frame": end,
+                        "start": start as f64 / second_timebase,
+                        "end": end as f64 / second_timebase,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        });
         *slot = Some(json!({
             "timebase": {"num": source.timebase.num, "den": source.timebase.den},
             "fps": timebase,
@@ -1043,6 +1403,8 @@ fn run_job(
                     "end": end as f64 / timebase,
                 }))
                 .collect::<Vec<_>>(),
+            "sync": pair,
+            "second": second_ranges,
         }));
     }
 
@@ -1126,10 +1488,36 @@ fn run_job(
         threads_per_chunk: state.threads_per_chunk,
     };
 
+    // A pair renders twice, so the bar has to count both from the start;
+    // otherwise it reaches the end halfway through the job.
+    if let Some(pair) = &decision.pair {
+        job.progress
+            .set_kept_frames((decision.kept_frames + pair.kept_frames()) as u64);
+    }
+
     let render_started = Instant::now();
-    let rendered = render_all(state, job, &source, &decision, &options, &output);
+    let rendered = render_all(state, job, &source, &decision.cut(), &options, &output, &job.id);
     let render_seconds = render_started.elapsed().as_secs_f64();
     let rendered = rendered?;
+
+    // The second recording, cut to the same moments. In sequence rather than
+    // alongside: each render already spreads itself across every core, and two at
+    // once would only take turns.
+    let second_rendered = match (&decision.pair, &second, &second_output) {
+        (Some(pair), Some(file), Some(path)) => {
+            let rendered = render_all(
+                state,
+                job,
+                file,
+                &pair.cut(),
+                &options,
+                path,
+                &format!("{}-second", job.id),
+            )?;
+            Some((path, pair, file, rendered))
+        }
+        _ => None,
+    };
 
     if source.info.has_video {
         Calibration::observe(
@@ -1167,6 +1555,28 @@ fn run_job(
         map.insert("video_encoder".into(), json!(options.video_codec));
         map.insert("hardware_encoder".into(), json!(encoder_is_hardware));
         map.insert("video_pipeline".into(), json!(encoder_pipeline));
+        if let Some(report) = &pair {
+            map.insert("sync".into(), json!(report));
+        }
+        if let Some((path, pair, file, rendered)) = &second_rendered {
+            let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            let fps = file.timebase.as_f64();
+            let kept_frames = pair.kept_frames();
+            map.insert(
+                "second".into(),
+                json!({
+                    "video_path": file.path.to_string_lossy(),
+                    "output_path": path.to_string_lossy(),
+                    "output_bytes": bytes,
+                    "segment_count": pair.segments.len(),
+                    "kept_frames": kept_frames,
+                    "rendered_frames": rendered.frames,
+                    "fps": fps,
+                    "output_duration": kept_frames as f64 / fps,
+                    "chunks": rendered.chunks,
+                }),
+            );
+        }
     }
     Ok(result)
 }
@@ -1183,18 +1593,22 @@ struct Rendered {
 
 /// Encode the picture in parallel chunks and the audio alongside it, then join
 /// everything into `output`.
+/// `tag` names this render's scratch files. A pair renders twice inside one job,
+/// and two renders sharing a name would overwrite each other's chunks.
+#[allow(clippy::too_many_arguments)]
 fn render_all(
     state: &AppState,
     job: &Job,
     source: &Source,
-    decision: &Decision,
+    cut: &Cut,
     options: &render::RenderOptions,
     output: &Path,
+    tag: &str,
 ) -> WorkResult<Rendered> {
     let timebase = source.timebase.as_f64();
     let chunks = if source.info.has_video {
         render::plan_chunks(
-            &decision.segments,
+            cut.segments,
             timebase,
             state.workers,
             state.max_segments_per_chunk,
@@ -1205,13 +1619,12 @@ fn render_all(
         Vec::new()
     };
 
-    let audio_total: u64 = decision
+    let audio_total: u64 = cut
         .streams
         .iter()
         .map(|analysis| {
             let frames = analysis.levels.len();
-            decision
-                .segments
+            cut.segments
                 .iter()
                 .map(|&(start, end)| {
                     analysis.boundaries[end.min(frames)] - analysis.boundaries[start.min(frames)]
@@ -1219,7 +1632,7 @@ fn render_all(
                 .sum::<u64>()
         })
         .sum();
-    job.progress.set_audio_total(audio_total);
+    job.progress.add_audio_total(audio_total);
 
     let path = &source.path;
     let audio_extension = if options.audio_codec == "aac" {
@@ -1235,14 +1648,14 @@ fn render_all(
             .info
             .audio
             .iter()
-            .zip(decision.streams.iter())
+            .zip(cut.streams.iter())
             .map(|(stream, analysis)| {
                 let track_path = state.work_dir.join(format!(
-                    "{}-a{}.{audio_extension}",
-                    job.id, stream.ordinal
+                    "{tag}-a{}.{audio_extension}",
+                    stream.ordinal
                 ));
                 let frames = analysis.levels.len();
-                let ranges: Vec<(u64, u64)> = decision
+                let ranges: Vec<(u64, u64)> = cut
                     .segments
                     .iter()
                     .map(|&(start, end)| {
@@ -1292,7 +1705,7 @@ fn render_all(
                         source.timebase,
                         options,
                         &state.work_dir,
-                        &job.id,
+                        tag,
                         job,
                     )
                     .map(|(path, frames)| (path, frames, phase_started.elapsed().as_secs_f64()))
@@ -1356,14 +1769,14 @@ fn render_all(
 
     // A lost frame here would mean silently dropping content, so the count ffmpeg
     // reported has to match the edit.
-    if source.info.has_video && frames.abs_diff(decision.kept_frames as u64) > 2 {
+    if source.info.has_video && frames.abs_diff(cut.kept_frames as u64) > 2 {
         for path in audio_paths.iter().chain(video_paths.iter()) {
             let _ = std::fs::remove_file(path);
         }
         return Err(WorkError::Failed(format!(
             "rendered {frames} frames but the edit keeps {}; refusing to write a \
              file that does not match the edit",
-            decision.kept_frames
+            cut.kept_frames
         )));
     }
 
@@ -1374,7 +1787,7 @@ fn render_all(
         &audio_paths,
         output,
         &state.work_dir,
-        &job.id,
+        tag,
         job,
     );
 

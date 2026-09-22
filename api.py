@@ -17,7 +17,7 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import pipeline
 import caption_polish
@@ -95,6 +95,12 @@ def init_database():
                 )
                 conn.execute(
                     text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS trim_segments JSONB")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS pair_video_id INTEGER")
+                )
+                conn.execute(
+                    text("ALTER TABLE videos ADD COLUMN IF NOT EXISTS sync_result JSONB")
                 )
                 position_exists = conn.execute(
                     text(
@@ -241,6 +247,9 @@ class VideoResponse(BaseModel):
     trim_filename: Optional[str] = None
     trim_result: Optional[dict] = None
     trim_job_id: Optional[str] = None
+    # The other recording of the same session, and how the two line up.
+    pair_video_id: Optional[int] = None
+    sync_result: Optional[dict] = None
     project_id: Optional[int] = None
     created_at: datetime
 
@@ -394,6 +403,24 @@ class AutoTrimRequest(BaseModel):
     # Encoder knobs for the render; ignored by the preview.
     crf: Optional[int] = None
     preset: Optional[str] = None
+    # The other recording of the same session. With this set, the trim cuts both
+    # files to one timeline instead of cutting this one alone.
+    second_video_id: Optional[int] = None
+    # A gap measured earlier, or corrected by hand. Left unset, the trim measures
+    # it again — which costs a few seconds and is the safer default.
+    offset_seconds: Optional[float] = None
+    # Whose sound decides the cut: "both" keeps a moment either recording spoke
+    # in, "primary" listens only to this one.
+    edit_source: Optional[str] = Field(default=None, pattern="^(both|primary)$")
+
+
+class SyncRequest(BaseModel):
+    """Which two recordings to line up."""
+
+    second_video_id: int
+    # Checking whether the two clocks kept the same time costs a few excerpt reads
+    # and is worth it for anything longer than a few minutes.
+    check_drift: Optional[bool] = None
 
 # ---------------------------------------------------------------------------
 # Auth & user management
@@ -1011,6 +1038,44 @@ def _attachment_headers(filename: str) -> dict:
 def _trim_output_name(video_id: int) -> str:
     return f"trimmed/video_{video_id}.mp4"
 
+
+def _paired_video(
+    video: models.Video, second_video_id: int, db: Session, current_user: models.User
+) -> models.Video:
+    """The other recording, checked to be the caller's and not this one."""
+    if second_video_id == video.id:
+        raise HTTPException(
+            status_code=400,
+            detail="A recording cannot be lined up against itself",
+        )
+    second = _get_owned_video(second_video_id, db, current_user)
+    if not (VIDEOS_DIR / second.filename).exists():
+        raise HTTPException(status_code=404, detail="The second video file is missing")
+    return second
+
+
+def _remember_pair(
+    video: models.Video, second: models.Video, report: dict, db: Session
+) -> None:
+    """Record on both rows that these two are one session, and how they line up.
+
+    On both, and mirrored: the gap is measured from the first recording's clock, so
+    the second one's copy is negated. Either page can then say where the other sits
+    without having to know which of them was measured against which.
+    """
+    video.pair_video_id = second.id
+    video.sync_result = report
+    second.pair_video_id = video.id
+    mirrored = dict(report)
+    for key in ("offset_seconds", "coarse_offset_seconds"):
+        if isinstance(report.get(key), (int, float)):
+            mirrored[key] = -report[key]
+    mirrored["a_duration"] = report.get("b_duration")
+    mirrored["b_duration"] = report.get("a_duration")
+    mirrored["mirrored"] = True
+    second.sync_result = mirrored
+    db.commit()
+
 def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
     """Record a finished trim on the video row.
 
@@ -1022,6 +1087,13 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
     state = status.get("state")
     if state not in ("done", "failed", "canceled"):
         return status
+
+    if state == "done" and status.get("mode") == "sync":
+        result = status.get("result") or {}
+        report = result.get("sync") or {}
+        second = db.query(models.Video).filter(models.Video.id == video.pair_video_id).first()
+        if second is not None and report:
+            _remember_pair(video, second, report, db)
 
     if state == "done" and status.get("mode") == "trim":
         result = status.get("result") or {}
@@ -1045,6 +1117,30 @@ def _reconcile_trim_job(video: models.Video, status: dict, db: Session) -> dict:
         )
         video.trim_filename = _trim_output_name(video.id)
         video.trim_result = summary
+
+        # A paired trim produced a second file, which belongs to the second
+        # recording: its own page then shows it, plays it and deletes it exactly
+        # as a trim of its own would.
+        paired = result.get("second") or {}
+        second = db.query(models.Video).filter(models.Video.id == video.pair_video_id).first()
+        if paired and second is not None:
+            second.trim_filename = _trim_output_name(second.id)
+            second.trim_result = {
+                **{key: value for key, value in summary.items() if key not in paired},
+                **paired,
+                "output_filename": _trim_output_name(second.id),
+                "paired_with": video.id,
+            }
+            try:
+                full = pipeline.auto_trim_job_segments(status["job_id"])
+                second_ranges = (full or {}).get("second") or {}
+                second.trim_segments = second_ranges.get("segments") or []
+                if second_ranges.get("timebase"):
+                    second.trim_result["timebase"] = second_ranges["timebase"]
+            except pipeline.AutoTrimError as exc:
+                logger.warning("Could not store the paired trim's segments: %s", exc)
+            if result.get("sync"):
+                _remember_pair(video, second, result["sync"], db)
 
     # A failed or cancelled run leaves any previous render untouched; only the
     # pointer to the job goes away.
@@ -1127,6 +1223,17 @@ def auto_trim_video(
     source = _auto_trim_source(video)
     TRIMMED_DIR.mkdir(parents=True, exist_ok=True)
 
+    paired = {}
+    second = None
+    if payload.second_video_id is not None:
+        second = _paired_video(video, payload.second_video_id, db, current_user)
+        paired = {
+            "second_video_path": str(VIDEOS_DIR / second.filename),
+            "second_output_path": str(VIDEOS_DIR / _trim_output_name(second.id)),
+            "offset_seconds": payload.offset_seconds,
+            "edit_source": payload.edit_source,
+        }
+
     try:
         status = pipeline.auto_trim_start(
             str(source),
@@ -1136,13 +1243,77 @@ def auto_trim_video(
             crf=payload.crf,
             preset=payload.preset,
             max_segments_returned=AUTO_TRIM_PREVIEW_SEGMENTS,
+            **paired,
         )
     except pipeline.AutoTrimError as exc:
         raise _auto_trim_failure(exc) from exc
 
     video.trim_job_id = status.get("job_id")
+    if second is not None:
+        # Recorded before the render finishes, so the poll that files the result
+        # knows which row the second file belongs to.
+        video.pair_video_id = second.id
+        second.pair_video_id = video.id
     db.commit()
     return status
+
+
+@app.post("/api/videos/{video_id}/auto-trim/sync", status_code=202)
+def sync_with_second_video(
+    video_id: int,
+    payload: SyncRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+) -> dict:
+    """Line this recording up with another one by what both microphones heard.
+
+    A camera on the person and a capture of their screen start whenever each was
+    pressed. Nothing else about the two files matches — not the picture, not the
+    levels, not the frame rate — but both heard the same room, and that is enough
+    to put them on one clock before either is cut.
+    """
+    video = _get_owned_video(video_id, db, current_user)
+    source = _auto_trim_source(video)
+    second = _paired_video(video, payload.second_video_id, db, current_user)
+
+    try:
+        status = pipeline.auto_trim_start(
+            str(source),
+            mode="sync",
+            second_video_path=str(VIDEOS_DIR / second.filename),
+            check_drift=payload.check_drift,
+        )
+    except pipeline.AutoTrimError as exc:
+        raise _auto_trim_failure(exc) from exc
+
+    video.trim_job_id = status.get("job_id")
+    video.pair_video_id = second.id
+    second.pair_video_id = video.id
+    db.commit()
+    return status
+
+
+@app.delete("/api/videos/{video_id}/pair", status_code=204)
+def unpair_video(
+    video_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Forget that these two recordings belong together. Neither file is touched."""
+    video = _get_owned_video(video_id, db, current_user)
+    if video.pair_video_id is not None:
+        other = (
+            db.query(models.Video)
+            .filter(models.Video.id == video.pair_video_id)
+            .first()
+        )
+        if other is not None and other.pair_video_id == video.id:
+            other.pair_video_id = None
+            other.sync_result = None
+    video.pair_video_id = None
+    video.sync_result = None
+    db.commit()
+    return Response(status_code=204)
 
 @app.get("/api/videos/{video_id}/auto-trim/job")
 def get_auto_trim_job(

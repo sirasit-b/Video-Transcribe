@@ -34,6 +34,8 @@ import {
   Cpu,
   FileCode,
   FileJson,
+  Link2,
+  CheckCircle2,
 } from "lucide-react";
 import { api, MEDIA_BASE, TOKEN_KEY } from "../../lib/api";
 
@@ -168,6 +170,41 @@ interface TrimResult extends TrimAnalysis {
   workers?: number;
 }
 
+/** One place the gap between the two recordings was measured. */
+interface SyncWindow {
+  at_seconds: number;
+  offset_seconds: number;
+  confidence: number;
+  clearance: number;
+}
+
+/** Whether the two recorders kept the same time. */
+interface SyncDrift {
+  ppm: number;
+  seconds_per_hour: number;
+  residual_seconds: number;
+  significant: boolean;
+  windows: SyncWindow[];
+}
+
+/** How two recordings of one session line up. */
+interface SyncResult {
+  /** Where the other recording starts on this one's clock. */
+  offset_seconds: number;
+  confidence: number;
+  clearance: number;
+  peak_ratio: number;
+  overlap_seconds: number;
+  reliable: boolean;
+  a_duration: number;
+  b_duration: number;
+  drift: SyncDrift | null;
+  refined?: SyncWindow | null;
+  warning: string | null;
+  /** Set on the second recording's copy, where the gap reads the other way. */
+  mirrored?: boolean;
+}
+
 /** What the trim service can encode with on its machine. */
 interface TrimCapabilities {
   cpu_model: string;
@@ -197,7 +234,7 @@ interface TrimEstimate {
 /** A trim job in flight, as the service reports it. */
 interface TrimJob {
   job_id: string | null;
-  mode?: "analyze" | "trim";
+  mode?: "analyze" | "trim" | "sync";
   state: "running" | "canceling" | "done" | "failed" | "canceled" | "none" | "expired";
   phase?: string;
   progress?: number;
@@ -222,6 +259,8 @@ interface VideoData {
   trim_filename: string | null;
   trim_result: TrimResult | null;
   trim_job_id: string | null;
+  pair_video_id: number | null;
+  sync_result: SyncResult | null;
 }
 
 interface TranscribeModel {
@@ -443,6 +482,13 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
   // Bumped after each render so the player reloads instead of showing the
   // previous trim from cache at the same URL.
   const [trimVersion, setTrimVersion] = useState(0);
+  // The other recording of the same session: a camera on the person and a capture
+  // of their screen are cut together or not at all.
+  const [pairChoice, setPairChoice] = useState<number | null>(null);
+  const [pairOptions, setPairOptions] = useState<VideoData[] | null>(null);
+  const [pairedVideo, setPairedVideo] = useState<VideoData | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isUnpairing, setIsUnpairing] = useState(false);
 
   const [isRenaming, setIsRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
@@ -512,6 +558,15 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     }
     return name;
   })();
+
+  // The pair as it stands: what the row remembers, or what is being chosen now.
+  const pairedId = video?.pair_video_id ?? null;
+  const sync = video?.sync_result ?? null;
+  const pairOffset = sync?.offset_seconds ?? null;
+  const pairedName =
+    pairedVideo?.original_name ??
+    pairOptions?.find((other) => other.id === pairedId)?.original_name ??
+    null;
 
   const captionSegments = video?.caption_segments ?? [];
   const matchedIndexes = findText
@@ -634,7 +689,20 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
     setError(null);
     try {
       const path = mode === "analyze" ? "auto-trim/preview" : "auto-trim";
-      const res = await api.post<TrimJob>(`/videos/${videoId}/${path}`, settings);
+      // A paired trim cuts both recordings to one timeline. The measured gap is
+      // passed back rather than measured again: it is the number on screen, the
+      // one that was agreed to.
+      const pair =
+        mode === "trim" && pairedId && video?.sync_result?.reliable
+          ? {
+              second_video_id: pairedId,
+              offset_seconds: pairOffset ?? undefined,
+            }
+          : {};
+      const res = await api.post<TrimJob>(`/videos/${videoId}/${path}`, {
+        ...settings,
+        ...pair,
+      });
       setTrimJob(res.data);
       if (mode === "analyze") setTrimPreview(null);
     } catch (err) {
@@ -645,6 +713,55 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
       );
     } finally {
       setStartingTrim(null);
+    }
+  };
+
+  /** Load the other recordings this one could be paired with. */
+  const loadPairOptions = async () => {
+    if (pairOptions) return;
+    try {
+      const res = await api.get<VideoData[]>(`/videos`);
+      // `videoId` is the route's string; the rows carry numbers.
+      setPairOptions(res.data.filter((other) => String(other.id) !== String(videoId)));
+    } catch (err) {
+      console.error(err);
+      setPairOptions([]);
+      setError("โหลดรายการวิดีโอไม่สำเร็จ");
+    }
+  };
+
+  /** Measure how far apart the two recordings started, by what both microphones
+   *  heard. Runs as a job, so the same progress bar reports it. */
+  const startSync = async () => {
+    if (!pairChoice) return;
+    setIsSyncing(true);
+    setError(null);
+    try {
+      const res = await api.post<TrimJob>(`/videos/${videoId}/auto-trim/sync`, {
+        second_video_id: pairChoice,
+      });
+      setTrimJob(res.data);
+    } catch (err) {
+      console.error(err);
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(detail || "ซิงค์เสียงสองคลิปไม่สำเร็จ");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const handleUnpair = async () => {
+    setIsUnpairing(true);
+    try {
+      await api.delete(`/videos/${videoId}/pair`);
+      const refreshed = await api.get<VideoData>(`/videos/${videoId}`);
+      setVideo(refreshed.data);
+      setPairChoice(null);
+    } catch (err) {
+      console.error(err);
+      setError("ยกเลิกการจับคู่ไม่สำเร็จ");
+    } finally {
+      setIsUnpairing(false);
     }
   };
 
@@ -974,7 +1091,7 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
         setTrimJob(status);
         if (status.analysis) setTrimPreview(status.analysis);
         if (status.state === "failed") setError(status.error || "งานตัดวิดีโอล้มเหลว");
-        if (status.state === "done" && status.mode === "trim") {
+        if (status.state === "done" && (status.mode === "trim" || status.mode === "sync")) {
           const refreshed = await api.get(`/videos/${videoId}`);
           if (stopped) return;
           setVideo(refreshed.data);
@@ -993,6 +1110,28 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
       clearInterval(timer);
     };
   }, [activeTrimJobId, videoId]);
+
+  // The paired recording itself, so the panel can name it — and show whether it
+  // has a cut of its own — without the picker having been opened.
+  const pairId = video?.pair_video_id ?? null;
+  useEffect(() => {
+    if (pairId === null) {
+      setPairedVideo(null);
+      return;
+    }
+    let active = true;
+    (async () => {
+      try {
+        const res = await api.get<VideoData>(`/videos/${pairId}`);
+        if (active) setPairedVideo(res.data);
+      } catch (err) {
+        console.error(err);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [pairId, trimVersion]);
 
   // How long a trim would take. Nothing is decoded for this, so it can be asked
   // for on load; once a preview has measured the kept share, it gets sharper.
@@ -1870,6 +2009,123 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
             {trimBlocked}
           </p>
         )}
+
+        {/* Two recordings of one session: line them up by sound, then cut both. */}
+        <div className="rounded-2xl border border-gray-200 bg-gray-50/60 p-4 flex flex-col gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                <Link2 className="w-4 h-4" strokeWidth={1.5} />
+                ถ่ายคน + อัดจอ: ซิงค์แล้วตัดพร้อมกัน
+              </h3>
+              <p className="text-xs text-gray-500 mt-1 max-w-2xl">
+                กล้องกับโปรแกรมอัดจอกดเริ่มคนละเวลา แต่ไมค์ทั้งสองตัวได้ยินห้องเดียวกัน
+                ระบบจะหาว่าเหลื่อมกันกี่วินาทีจากเสียง แล้วตัดทั้งคู่บนไทม์ไลน์เดียวกัน
+                ให้ยังตรงกันทุกช่วงที่ตัด
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={pairChoice ?? pairedId ?? ""}
+                onFocus={loadPairOptions}
+                onChange={(e) => setPairChoice(e.target.value ? Number(e.target.value) : null)}
+                disabled={trimJobActive}
+                aria-label="วิดีโออีกตัวของเซสชันเดียวกัน"
+                className="border border-gray-200 rounded-full px-4 py-2 text-sm text-gray-700 bg-white max-w-xs focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400 disabled:opacity-50"
+              >
+                <option value="">เลือกวิดีโออีกตัว…</option>
+                {pairedVideo && !(pairOptions ?? []).some((o) => o.id === pairedVideo.id) && (
+                  <option value={pairedVideo.id}>{pairedVideo.original_name}</option>
+                )}
+                {(pairOptions ?? []).map((other) => (
+                  <option key={other.id} value={other.id}>
+                    {other.original_name}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={startSync}
+                disabled={!pairChoice || trimJobActive || isSyncing}
+                title="วัดจากเสียงว่าสองคลิปเหลื่อมกันเท่าไหร่"
+                className="border border-gray-300 text-gray-700 px-4 py-2 rounded-full text-sm font-medium hover:bg-white disabled:opacity-50 flex items-center gap-2 transition-colors"
+              >
+                {isSyncing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                ) : (
+                  <Link2 className="w-4 h-4" strokeWidth={1.5} />
+                )}
+                ซิงค์เสียง
+              </button>
+            </div>
+          </div>
+
+          {sync && (
+            <div className="flex flex-col gap-2 border-t border-gray-200 pt-3">
+              {sync.reliable ? (
+                <p className="text-sm text-gray-700 flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" strokeWidth={1.5} />
+                  <span>
+                    {pairedName ? <strong className="font-medium">{pairedName}</strong> : "อีกคลิป"}
+                    {" เริ่ม"}
+                    {sync.offset_seconds >= 0 ? "ช้ากว่า" : "เร็วกว่า"}คลิปนี้{" "}
+                    <strong className="font-medium tabular-nums">
+                      {Math.abs(sync.offset_seconds).toFixed(3)} วินาที
+                    </strong>
+                  </span>
+                  <span className="text-xs text-gray-500">
+                    ซ้อนกัน {formatDuration(sync.overlap_seconds)} · ความชัดของจุดตรงกัน{" "}
+                    {sync.clearance.toFixed(0)}σ
+                  </span>
+                </p>
+              ) : (
+                <p className="text-sm text-amber-700 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" strokeWidth={1.5} />
+                  <span>{sync.warning || "จับคู่เสียงสองคลิปนี้ไม่ได้"}</span>
+                </p>
+              )}
+
+              {sync.drift && sync.drift.significant && (
+                <p className="text-xs text-amber-700 flex items-start gap-2">
+                  <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" strokeWidth={1.5} />
+                  <span>
+                    นาฬิกาสองเครื่องเดินไม่เท่ากัน {Math.abs(sync.drift.ppm).toFixed(0)} ppm
+                    (ประมาณ {Math.abs(sync.drift.seconds_per_hour).toFixed(2)} วินาทีต่อชั่วโมง) —
+                    ระบบชดเชยให้ทีละช่วงตอนตัด ทั้งคู่จึงยังตรงกันจนจบคลิป
+                  </span>
+                </p>
+              )}
+
+              {pairedId && (
+                <div className="flex flex-wrap items-center gap-3 text-xs">
+                  <button
+                    onClick={handleUnpair}
+                    disabled={trimJobActive || isUnpairing}
+                    className="text-gray-500 hover:text-gray-700 underline underline-offset-2 disabled:opacity-50"
+                  >
+                    ยกเลิกการจับคู่
+                  </button>
+                  <Link
+                    href={`/videos/${pairedId}`}
+                    className="text-blue-600 hover:text-blue-700 underline underline-offset-2"
+                  >
+                    เปิดอีกคลิป
+                  </Link>
+                  {sync.reliable &&
+                    (pairedVideo?.trim_filename ? (
+                      <span className="text-emerald-700">
+                        ตัดแล้วทั้งคู่ — อีกคลิปยาว{" "}
+                        {formatDuration(pairedVideo.trim_result?.output_duration ?? 0)}
+                      </span>
+                    ) : (
+                      <span className="text-gray-400">
+                        กด “{video.trim_filename ? "ตัดใหม่" : "ตัดอัตโนมัติ"}” แล้วจะได้ไฟล์ที่ตัดแล้วทั้งสองตัว
+                      </span>
+                    ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* What it will cost in time, before anything is started. */}
         {trimEstimate && !trimJobActive && !trimBlocked && (
