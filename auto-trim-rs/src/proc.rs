@@ -74,6 +74,34 @@ impl Ffmpeg {
         Ok(())
     }
 
+    /// Wait, and hand back what the process printed.
+    ///
+    /// For the few runs where the output *is* stderr: a meter reports its reading
+    /// there, and the file it was asked about is written to nowhere.
+    pub fn wait_for_stderr(self, job: &Job) -> WorkResult<String> {
+        let status = {
+            let mut child = self.child.lock().expect("child poisoned");
+            child
+                .wait()
+                .map_err(|err| WorkError::Failed(format!("ffmpeg did not exit cleanly: {err}")))?
+        };
+        job.forget_child(&self.child);
+        let message = self.stderr.join().unwrap_or_default();
+
+        if job.is_canceled() {
+            return Err(WorkError::Canceled);
+        }
+        if !status.success() {
+            let trimmed = message.trim();
+            return Err(WorkError::Failed(if trimmed.is_empty() {
+                format!("ffmpeg exited with {status}")
+            } else {
+                trimmed.to_string()
+            }));
+        }
+        Ok(message)
+    }
+
     /// Reap a process we killed on purpose: its exit status carries no news.
     pub fn discard(self, job: &Job) {
         if let Ok(mut child) = self.child.lock() {

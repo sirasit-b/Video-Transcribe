@@ -31,6 +31,33 @@ class Project(Base):
     name = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class SyncSession(Base):
+    """Several recordings of one moment, cut as one.
+
+    A camera on the person and a capture of their screen — or a second screen, or
+    a second camera — are one take recorded several times. They are brought to the
+    same loudness, lined up by what their microphones share, and cut on one
+    timeline, because an edit decided separately for each would put the cuts in
+    different places and the recordings would never fit together again.
+    """
+
+    __tablename__ = "sync_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    # Whose clock the session runs on; every other member is placed against it.
+    # The first recording added, unless it is changed.
+    reference_video_id = Column(Integer, nullable=True)
+    # The lining-up or the cut currently running, if any. Kept here rather than in
+    # the request that started it, so a reload picks the polling back up.
+    job_id = Column(String, nullable=True)
+    # What the last run found: where each recording sits, how loud it was, how far
+    # it had to move, and what the cut came to.
+    result = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Video(Base):
     __tablename__ = "videos"
 
@@ -63,6 +90,9 @@ class Video(Base):
     # enough to be worth keeping out of VideoResponse, and only read when an edit
     # is exported to an editor.
     trim_segments = Column(JSON, nullable=True)
+    # The session this recording belongs to, when it is one of several views of
+    # the same moment.
+    sync_session_id = Column(Integer, nullable=True, index=True)
     # The other recording of the same session — a camera take and a screen capture
     # are two views of one moment, and once they have been lined up they are cut
     # together. Set on both rows, each pointing at the other.

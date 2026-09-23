@@ -91,6 +91,24 @@ fn max_abs(samples: &[i16]) -> i16 {
 /// `first_byte` is where this buffer starts in the decoded stream, and
 /// `range_frames` how long the kept range is, both so a buffer that covers only
 /// part of a range still fades the right samples.
+/// Scale every sample, for a track being brought to the group's level.
+///
+/// Applied here rather than through a `volume` filter because the samples are
+/// already in hand on their way to the encoder: one multiply over a buffer that is
+/// being copied anyway, instead of another filter graph to set up and feed.
+/// Saturating, not wrapping — a sample pushed past full scale has to come out
+/// loud, not inverted.
+fn apply_gain(buffer: &mut [u8], factor: f32) {
+    if (factor - 1.0).abs() < 1e-6 {
+        return;
+    }
+    for sample in buffer.chunks_exact_mut(2) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]) as f32 * factor;
+        let clamped = value.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        sample.copy_from_slice(&clamped.to_le_bytes());
+    }
+}
+
 fn apply_edge_fades(
     buffer: &mut [u8],
     channels: usize,
@@ -304,9 +322,12 @@ pub fn splice_to_encoder(
     bitrate: &str,
     coder: &str,
     fade_ms: f64,
+    // How far this track moves to match the rest of its group, in decibels.
+    gain_db: f64,
     job: &Job,
 ) -> WorkResult<()> {
     let frame_bytes = (channels * 2) as u64;
+    let gain = 10f64.powf(gain_db / 20.0) as f32;
     let fade_frames = if fade_ms > 0.0 {
         ((fade_ms / 1000.0) * sample_rate as f64).round().max(1.0) as u64
     } else {
@@ -444,6 +465,7 @@ pub fn splice_to_encoder(
                     let from = (start.max(chunk_start) - chunk_start) as usize;
                     let to = (end.min(chunk_end) - chunk_start) as usize;
                     let mut piece = read_buffer[from..to].to_vec();
+                    apply_gain(&mut piece, gain);
                     apply_edge_fades(
                         &mut piece,
                         channels,
@@ -644,6 +666,30 @@ mod tests {
         let mut buffer = filled(8, 5000);
         apply_edge_fades(&mut buffer, 1, 0, 0, 8, 0);
         assert_eq!(mono(&buffer), vec![5000; 8]);
+    }
+
+    #[test]
+    fn gain_scales_samples_and_saturates_rather_than_wrapping() {
+        // 6dB doubles; a sample already past half scale has to land at full scale
+        // rather than wrap round to the other sign, which would be a crack.
+        let mut buffer: Vec<u8> = [1000i16, -1000, 20_000, -20_000]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        apply_gain(&mut buffer, 2.0);
+        let out: Vec<i16> = buffer
+            .chunks_exact(2)
+            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        assert_eq!(out, vec![2000, -2000, i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn a_track_already_at_the_groups_level_is_untouched() {
+        let mut buffer: Vec<u8> = [1234i16, -4321].iter().flat_map(|s| s.to_le_bytes()).collect();
+        let before = buffer.clone();
+        apply_gain(&mut buffer, 1.0);
+        assert_eq!(buffer, before);
     }
 
     #[test]

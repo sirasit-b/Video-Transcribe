@@ -192,8 +192,11 @@ interface SyncResult {
   /** Where the other recording starts on this one's clock. */
   offset_seconds: number;
   confidence: number;
-  clearance: number;
-  peak_ratio: number;
+  /** Absent when the offset was supplied rather than measured — and on rows
+   *  written before that was said out loud, where it arrived as null. */
+  clearance: number | null;
+  peak_ratio: number | null;
+  supplied?: boolean;
   overlap_seconds: number;
   reliable: boolean;
   a_duration: number;
@@ -2073,8 +2076,10 @@ export default function VideoPage({ params }: { params: Promise<{ id: string }> 
                     </strong>
                   </span>
                   <span className="text-xs text-gray-500">
-                    ซ้อนกัน {formatDuration(sync.overlap_seconds)} · ความชัดของจุดตรงกัน{" "}
-                    {sync.clearance.toFixed(0)}σ
+                    ซ้อนกัน {formatDuration(sync.overlap_seconds)}
+                    {typeof sync.clearance === "number"
+                      ? ` · ความชัดของจุดตรงกัน ${sync.clearance.toFixed(0)}σ`
+                      : " · ค่าที่ระบุเอง"}
                   </span>
                 </p>
               ) : (

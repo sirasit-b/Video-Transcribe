@@ -48,6 +48,11 @@ services:
       - MAX_DURATION_SECONDS=10800
     volumes:
       - videos_data:/app/videos
+    # Only matters when the machine is busy: at rest a trim still uses everything
+    # it can, but under contention the database and the API get served first. A
+    # render that saturates every core for ten minutes otherwise takes the site
+    # down with it, which is how this was found.
+    cpu_shares: 512
     restart: unless-stopped
 
   backend:

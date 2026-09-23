@@ -51,6 +51,8 @@ pub struct RenderOptions {
     /// Milliseconds of ramp at each end of a kept range, so a splice that lands
     /// mid-waveform does not click. 0 turns it off.
     pub audio_fade_ms: f64,
+    /// How far this track moves to match the rest of its group, in decibels.
+    pub audio_gain_db: f64,
     pub threads_per_chunk: usize,
 }
 
@@ -291,6 +293,11 @@ pub fn render_chunk(
 }
 
 /// Join the chunks and mux them with the audio, copying every stream.
+/// Join the rendered chunks and the spliced audio into the finished file.
+///
+/// `already_done` is how many milliseconds of output earlier members of a group
+/// have already written, so the progress this one reports continues theirs rather
+/// than restarting the bar at each file.
 pub fn concat_and_mux(
     ffmpeg: &str,
     chunks: &[PathBuf],
@@ -298,10 +305,13 @@ pub fn concat_and_mux(
     output: &Path,
     work_dir: &Path,
     job_id: &str,
+    already_done: u64,
     job: &Job,
 ) -> WorkResult<()> {
     let mut command = Command::new(ffmpeg);
-    command.args(["-v", "error", "-nostdin", "-y"]);
+    // Progress on stdout for the same reason the encodes report it: this step
+    // moves gigabytes and used to do it with the bar frozen.
+    command.args(["-v", "error", "-nostdin", "-y", "-progress", "pipe:1", "-stats_period", "0.5"]);
 
     let mut list_path: Option<PathBuf> = None;
     let mut audio_input_base = 0;
@@ -332,9 +342,29 @@ pub fn concat_and_mux(
     if is_mp4_like(output) {
         command.args(["-movflags", "+faststart"]);
     }
-    command.arg(output).stdin(Stdio::null());
+    command.arg(output).stdin(Stdio::null()).stdout(Stdio::piped());
 
-    let process = Ffmpeg::spawn(&mut command, job).map_err(WorkError::Failed)?;
+    let mut process = Ffmpeg::spawn(&mut command, job).map_err(WorkError::Failed)?;
+    let stdout = process.stdout.take().expect("stdout is piped");
+
+    // Read as it goes, both for the bar and because a progress pipe nobody drains
+    // fills up and stops the process we are waiting for.
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if job.is_canceled() {
+            process.kill();
+            break;
+        }
+        if let Some(value) = line.strip_prefix("out_time_ms=") {
+            if let Ok(microseconds) = value.trim().parse::<u64>() {
+                // Named `_ms`, reported in microseconds — one of ffmpeg's older
+                // misnamings, and reading it as milliseconds would put the bar a
+                // thousand times ahead of the work.
+                job.progress.set_finished_ms(already_done + microseconds / 1000);
+            }
+        }
+    }
+
     let result = process.wait(job);
     if let Some(path) = list_path {
         let _ = std::fs::remove_file(path);
